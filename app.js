@@ -24,12 +24,15 @@ app.get('/contacts/staff', (req, res) => {
             u.name AS usuario_nombre,
             u.last_name, 
             u.last_name AS usuario_apellido,
-            u.ci, 
+            u.document_type,
+            u.document_number,
+            CONCAT(u.document_type, u.document_number) AS ci, 
             u.date_in,
             p.local_phone,
             p.local_phone AS telefono_local,
-            p.cell_phone,
-            p.cell_phone AS telefono_personal,
+            cl.id AS line_id,
+            cl.phone_number AS cell_phone,
+            cl.phone_number AS telefono_personal,
             p.ext,
             p.ext AS extension,
             d.name AS department,
@@ -44,6 +47,8 @@ app.get('/contacts/staff', (req, res) => {
         LEFT JOIN user_departments ud ON u.id = ud.user_id
         LEFT JOIN departments d ON ud.department_id = d.id
         LEFT JOIN places pl ON d.place_id = pl.id
+        LEFT JOIN user_assigned_lines ual ON u.id = ual.user_id AND ual.return_date IS NULL
+        LEFT JOIN company_lines cl ON ual.line_id = cl.id
     `;
 
     if (query) {
@@ -74,12 +79,15 @@ app.get('/contacts/staff/search/:query', (req, res) => {
             u.name AS usuario_nombre,
             u.last_name, 
             u.last_name AS usuario_apellido,
-            u.ci, 
+            u.document_type,
+            u.document_number,
+            CONCAT(u.document_type, u.document_number) AS ci, 
             u.date_in,
             p.local_phone,
             p.local_phone AS telefono_local,
-            p.cell_phone,
-            p.cell_phone AS telefono_personal,
+            cl.id AS line_id,
+            cl.phone_number AS cell_phone,
+            cl.phone_number AS telefono_personal,
             p.ext,
             p.ext AS extension,
             d.name AS department,
@@ -94,6 +102,8 @@ app.get('/contacts/staff/search/:query', (req, res) => {
         LEFT JOIN user_departments ud ON u.id = ud.user_id
         LEFT JOIN departments d ON ud.department_id = d.id
         LEFT JOIN places pl ON d.place_id = pl.id
+        LEFT JOIN user_assigned_lines ual ON u.id = ual.user_id AND ual.return_date IS NULL
+        LEFT JOIN company_lines cl ON ual.line_id = cl.id
     `;
 
     if (query) {
@@ -116,8 +126,8 @@ app.get('/contacts/staff/search/:query', (req, res) => {
 
 //? endpoint para crear un usuario (soporta /contacts/create y /contacts/staff)
 app.post(['/contacts/create', '/contacts/staff'], (req, res) => {
-    const {name, last_name, ci, date_in } = req.body;
-    db.query('INSERT INTO users (name, last_name, ci, date_in) VALUES (?,?,?,?)', [name, last_name, ci, date_in], (err, results) => {
+    const {name, last_name, document_type, document_number, email, username, password, date_in, status } = req.body;
+    db.query('INSERT INTO users (name, last_name, document_type, document_number, email, username, password, date_in, status) VALUES (?,?,?,?,?,?,?,?,?)', [name, last_name, document_type, document_number, email, username, password, date_in, status], (err, results) => {
         if (err) return res.status(500).send(err);
         res.json(results);
     });
@@ -126,8 +136,8 @@ app.post(['/contacts/create', '/contacts/staff'], (req, res) => {
 //? endpoint para actualizar un usuario (soporta /contacts/update/:id y /contacts/staff/:id)
 app.put(['/contacts/update/:id', '/contacts/staff/:id'], (req, res) => {
     const id = req.params.id;
-    const {name, last_name, ci, date_in } = req.body;
-    db.query('UPDATE users SET name = ?, last_name = ?, ci = ?, date_in = ? WHERE id = ?', [name,last_name,ci,date_in, id], (err, results) => {
+    const {name, last_name, document_type, document_number, email, username, password, date_in, status } = req.body;
+    db.query('UPDATE users SET name = ?, last_name = ?, document_type = ?, document_number = ?, email = ?, username = ?, password = ?, date_in = ?, status = ? WHERE id = ?', [name,last_name,document_type,document_number,email,username,password,date_in,status, id], (err, results) => {
         if (err) return res.status(500).send(err);
         res.json(results);
     });
@@ -176,12 +186,15 @@ app.get('/contacts/places/:name', (req, res) => {
             u.name AS usuario_nombre,
             u.last_name,
             u.last_name AS usuario_apellido,
-            u.ci,
+            u.document_type,
+            u.document_number,
+            CONCAT(u.document_type, u.document_number) AS ci,
             u.date_in,
             p.local_phone,
             p.local_phone AS telefono_local,
-            p.cell_phone,
-            p.cell_phone AS telefono_personal,
+            cl.id AS line_id,
+            cl.phone_number AS cell_phone,
+            cl.phone_number AS telefono_personal,
             p.ext,
             p.ext AS extension,
             d.name AS department,
@@ -195,6 +208,8 @@ app.get('/contacts/places/:name', (req, res) => {
         INNER JOIN user_departments ud ON u.id = ud.user_id 
         INNER JOIN departments d ON ud.department_id = d.id 
         INNER JOIN places pl ON d.place_id = pl.id  
+        LEFT JOIN user_assigned_lines ual ON u.id = ual.user_id AND ual.return_date IS NULL
+        LEFT JOIN company_lines cl ON ual.line_id = cl.id
         WHERE pl.name = ?
     `;
 
@@ -214,6 +229,8 @@ app.post('/contacts/create-full', (req, res) => {
         name,
         last_name,
         ci,
+        document_type,
+        document_number,
         date_in,
         local_phone,
         cell_phone,
@@ -222,6 +239,16 @@ app.post('/contacts/create-full', (req, res) => {
         position
     } = req.body;
 
+    let doc_type = document_type || 'V';
+    let doc_number = document_number || ci;
+    
+    if (ci && !document_number) {
+        if (ci.toUpperCase().startsWith('V') || ci.toUpperCase().startsWith('E')) {
+            doc_type = ci.toUpperCase().charAt(0);
+            doc_number = ci.substring(1).replace(/[^0-9]/g, '');
+        }
+    }
+
     db.beginTransaction((err) => {
         if (err) {
             console.error("Failed to begin transaction:", err);
@@ -229,8 +256,8 @@ app.post('/contacts/create-full', (req, res) => {
         }
 
         // 1. Insert into users
-        const userQuery = 'INSERT INTO users (name, last_name, ci, date_in) VALUES (?, ?, ?, ?)';
-        db.query(userQuery, [name, last_name, ci || null, date_in || null], (err, userResult) => {
+        const userQuery = 'INSERT INTO users (name, last_name, document_type, document_number, date_in) VALUES (?, ?, ?, ?, ?)';
+        db.query(userQuery, [name, last_name, doc_type, doc_number || null, date_in || null], (err, userResult) => {
             if (err) {
                 console.error("Failed to insert user:", err);
                 return db.rollback(() => {
@@ -241,8 +268,8 @@ app.post('/contacts/create-full', (req, res) => {
             const userId = userResult.insertId;
 
             // 2. Insert into phone_numbers
-            const phoneQuery = 'INSERT INTO phone_numbers (user_id, local_phone, cell_phone, ext) VALUES (?, ?, ?, ?)';
-            db.query(phoneQuery, [userId, local_phone || null, cell_phone || null, ext || null], (err) => {
+            const phoneQuery = 'INSERT INTO phone_numbers (user_id, local_phone) VALUES (?, ?)';
+            db.query(phoneQuery, [userId, local_phone || null], (err) => {
                 if (err) {
                     console.error("Failed to insert phone numbers:", err);
                     return db.rollback(() => {
@@ -260,15 +287,38 @@ app.post('/contacts/create-full', (req, res) => {
                         });
                     }
 
-                    db.commit((err) => {
-                        if (err) {
-                            console.error("Failed to commit transaction:", err);
-                            return db.rollback(() => {
-                                res.status(500).json({ error: "Failed to commit transaction", details: err });
+                    const assignLine = () => {
+                        if (!cell_phone) return commitTx();
+                        
+                        const assignQuery = 'INSERT INTO user_assigned_lines (user_id, line_id, assigned_date) VALUES (?, ?, CURDATE())';
+                        db.query(assignQuery, [userId, cell_phone], (err) => {
+                            if (err) {
+                                console.error("Failed to assign company line:", err);
+                                return db.rollback(() => res.status(500).json({ error: "Failed to assign line", details: err }));
+                            }
+
+                            const updateLineQuery = "UPDATE company_lines SET status = 'asignado' WHERE id = ?";
+                            db.query(updateLineQuery, [cell_phone], (err) => {
+                                if (err) {
+                                    console.error("Failed to update company line status:", err);
+                                    return db.rollback(() => res.status(500).json({ error: "Failed to update line status", details: err }));
+                                }
+                                commitTx();
                             });
-                        }
-                        res.status(201).json({ success: true, userId });
-                    });
+                        });
+                    };
+
+                    const commitTx = () => {
+                        db.commit((err) => {
+                            if (err) {
+                                console.error("Failed to commit transaction:", err);
+                                return db.rollback(() => res.status(500).json({ error: "Failed to commit transaction", details: err }));
+                            }
+                            res.status(201).json({ success: true, userId });
+                        });
+                    };
+
+                    assignLine();
                 });
             });
         });
@@ -282,6 +332,8 @@ app.put('/contacts/update-full/:id', (req, res) => {
         name,
         last_name,
         ci,
+        document_type,
+        document_number,
         date_in,
         local_phone,
         cell_phone,
@@ -290,6 +342,16 @@ app.put('/contacts/update-full/:id', (req, res) => {
         position
     } = req.body;
 
+    let doc_type = document_type || 'V';
+    let doc_number = document_number || ci;
+    
+    if (ci && !document_number) {
+        if (ci.toUpperCase().startsWith('V') || ci.toUpperCase().startsWith('E')) {
+            doc_type = ci.toUpperCase().charAt(0);
+            doc_number = ci.substring(1).replace(/[^0-9]/g, '');
+        }
+    }
+
     db.beginTransaction((err) => {
         if (err) {
             console.error("Failed to begin transaction:", err);
@@ -297,8 +359,8 @@ app.put('/contacts/update-full/:id', (req, res) => {
         }
 
         // 1. Update users table
-        const userQuery = 'UPDATE users SET name = ?, last_name = ?, ci = ?, date_in = ? WHERE id = ?';
-        db.query(userQuery, [name, last_name, ci, date_in || null, id], (err) => {
+        const userQuery = 'UPDATE users SET name = ?, last_name = ?, document_type = ?, document_number = ?, date_in = ? WHERE id = ?';
+        db.query(userQuery, [name, last_name, doc_type, doc_number || null, date_in || null, id], (err) => {
             if (err) {
                 console.error("Failed to update user:", err);
                 return db.rollback(() => {
@@ -308,14 +370,12 @@ app.put('/contacts/update-full/:id', (req, res) => {
 
             // 2. Update phone_numbers table
             const phoneQuery = `
-                INSERT INTO phone_numbers (user_id, local_phone, cell_phone, ext) 
-                VALUES (?, ?, ?, ?)
+                INSERT INTO phone_numbers (user_id, local_phone) 
+                VALUES (?, ?)
                 ON DUPLICATE KEY UPDATE 
-                    local_phone = VALUES(local_phone), 
-                    cell_phone = VALUES(cell_phone), 
-                    ext = VALUES(ext)
+                    local_phone = VALUES(local_phone)
             `;
-            db.query(phoneQuery, [id, local_phone || null, cell_phone || null, ext || null], (err) => {
+            db.query(phoneQuery, [id, local_phone || null], (err) => {
                 if (err) {
                     console.error("Failed to update phone numbers:", err);
                     return db.rollback(() => {
@@ -342,19 +402,79 @@ app.put('/contacts/update-full/:id', (req, res) => {
                             });
                         }
 
-                        db.commit((err) => {
-                            if (err) {
-                                console.error("Failed to commit transaction:", err);
-                                return db.rollback(() => {
-                                    res.status(500).json({ error: "Failed to commit transaction", details: err });
+                        const updateLineAssignment = () => {
+                            // Check current active line
+                            db.query('SELECT id, line_id FROM user_assigned_lines WHERE user_id = ? AND return_date IS NULL', [id], (err, currentLineRes) => {
+                                if (err) {
+                                    return db.rollback(() => res.status(500).json({ error: "Failed to check current line", details: err }));
+                                }
+                                
+                                const currentAssigned = currentLineRes[0];
+                                const newLineId = cell_phone ? Number(cell_phone) : null;
+                                
+                                // Step A: If there's an existing line and it's different from the new one, return it
+                                const releaseOldLine = (callback) => {
+                                    if (currentAssigned && currentAssigned.line_id !== newLineId) {
+                                        db.query('UPDATE user_assigned_lines SET return_date = CURDATE() WHERE id = ?', [currentAssigned.id], (err) => {
+                                            if (err) return db.rollback(() => res.status(500).json({ error: "Failed to release old line assignment", details: err }));
+                                            
+                                            db.query("UPDATE company_lines SET status = 'disponible' WHERE id = ?", [currentAssigned.line_id], (err) => {
+                                                if (err) return db.rollback(() => res.status(500).json({ error: "Failed to update old line status", details: err }));
+                                                callback();
+                                            });
+                                        });
+                                    } else {
+                                        callback();
+                                    }
+                                };
+                                
+                                // Step B: If there's a new line and it's different from the current one, assign it
+                                const assignNewLine = (callback) => {
+                                    if (newLineId && (!currentAssigned || currentAssigned.line_id !== newLineId)) {
+                                        db.query('INSERT INTO user_assigned_lines (user_id, line_id, assigned_date) VALUES (?, ?, CURDATE())', [id, newLineId], (err) => {
+                                            if (err) return db.rollback(() => res.status(500).json({ error: "Failed to assign new line", details: err }));
+                                            
+                                            db.query("UPDATE company_lines SET status = 'asignado' WHERE id = ?", [newLineId], (err) => {
+                                                if (err) return db.rollback(() => res.status(500).json({ error: "Failed to update new line status", details: err }));
+                                                callback();
+                                            });
+                                        });
+                                    } else {
+                                        callback();
+                                    }
+                                };
+                                
+                                releaseOldLine(() => {
+                                    assignNewLine(() => {
+                                        commitTx();
+                                    });
                                 });
-                            }
-                            res.status(200).json({ success: true });
-                        });
+                            });
+                        };
+
+                        const commitTx = () => {
+                            db.commit((err) => {
+                                if (err) {
+                                    console.error("Failed to commit transaction:", err);
+                                    return db.rollback(() => res.status(500).json({ error: "Failed to commit transaction", details: err }));
+                                }
+                                res.status(200).json({ success: true });
+                            });
+                        };
+                        
+                        updateLineAssignment();
                     });
                 });
             });
         });
+    });
+});
+
+//? endpoint ver las lista de las lineas de compañia disponibles
+app.get('/contacts/company-lines/available', (req, res) => {
+    db.query("SELECT id, phone_number, operator FROM company_lines WHERE status = 'disponible' AND active_status = 'activa'", (err, results) => {
+        if (err) return res.status(500).send(err);
+        res.json(results);
     });
 });
 
