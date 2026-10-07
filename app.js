@@ -1,11 +1,16 @@
-const express = require('express')
+const express = require('express');
 const mysql = require('mysql2');
 const cors = require('cors');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+
 const port = 3000;
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_key_123';
 
 const db = mysql.createConnection({
     host: 'localhost',
@@ -127,7 +132,8 @@ app.get('/contacts/staff/search/:query', (req, res) => {
 //? endpoint para crear un usuario (soporta /contacts/create y /contacts/staff)
 app.post(['/contacts/create', '/contacts/staff'], (req, res) => {
     const {name, last_name, document_type, document_number, email, username, password, date_in, status } = req.body;
-    db.query('INSERT INTO users (name, last_name, document_type, document_number, email, username, password, date_in, status) VALUES (?,?,?,?,?,?,?,?,?)', [name, last_name, document_type, document_number, email, username, password, date_in, status], (err, results) => {
+    const hashedPassword = password ? bcrypt.hashSync(password, 10) : null;
+    db.query('INSERT INTO users (name, last_name, document_type, document_number, email, username, password, date_in, status) VALUES (?,?,?,?,?,?,?,?,?)', [name, last_name, document_type, document_number, email, username, hashedPassword, date_in, status], (err, results) => {
         if (err) return res.status(500).send(err);
         res.json(results);
     });
@@ -236,7 +242,10 @@ app.post('/contacts/create-full', (req, res) => {
         cell_phone,
         ext,
         department_id,
-        position
+        position,
+        email,
+        username,
+        password
     } = req.body;
 
     let doc_type = document_type || 'V';
@@ -249,6 +258,8 @@ app.post('/contacts/create-full', (req, res) => {
         }
     }
 
+    const hashedPassword = password ? bcrypt.hashSync(password, 10) : null;
+
     db.beginTransaction((err) => {
         if (err) {
             console.error("Failed to begin transaction:", err);
@@ -256,8 +267,8 @@ app.post('/contacts/create-full', (req, res) => {
         }
 
         // 1. Insert into users
-        const userQuery = 'INSERT INTO users (name, last_name, document_type, document_number, date_in) VALUES (?, ?, ?, ?, ?)';
-        db.query(userQuery, [name, last_name, doc_type, doc_number || null, date_in || null], (err, userResult) => {
+        const userQuery = 'INSERT INTO users (name, last_name, document_type, document_number, email, username, password, date_in) VALUES (?, ?, ?, ?, ?, ?, ?, ?)';
+        db.query(userQuery, [name, last_name, doc_type, doc_number || null, email || null, username || null, hashedPassword, date_in || null], (err, userResult) => {
             if (err) {
                 console.error("Failed to insert user:", err);
                 return db.rollback(() => {
@@ -475,6 +486,42 @@ app.get('/contacts/company-lines/available', (req, res) => {
     db.query("SELECT id, phone_number, operator FROM company_lines WHERE status = 'disponible' AND active_status = 'activa'", (err, results) => {
         if (err) return res.status(500).send(err);
         res.json(results);
+    });
+});
+
+//? endpoint de login
+app.post('/api/auth/login', (req, res) => {
+    const { username, password } = req.body;
+
+    if (!username || !password) {
+        return res.status(400).json({ error: 'Usuario y contraseña son requeridos' });
+    }
+
+    db.query('SELECT * FROM users WHERE username = ?', [username], (err, results) => {
+        if (err) return res.status(500).json({ error: 'Error en la base de datos' });
+        
+        if (results.length === 0) {
+            return res.status(401).json({ error: 'Usuario no encontrado' });
+        }
+
+        const user = results[0];
+
+        if (!user.password) {
+            return res.status(401).json({ error: 'Usuario no tiene contraseña configurada' });
+        }
+
+        const validPassword = bcrypt.compareSync(password, user.password);
+        if (!validPassword) {
+            return res.status(401).json({ error: 'Contraseña incorrecta' });
+        }
+
+        const token = jwt.sign(
+            { id: user.id, username: user.username, role: 'admin' }, 
+            JWT_SECRET, 
+            { expiresIn: '8h' }
+        );
+
+        res.json({ success: true, token, user: { id: user.id, name: user.name, username: user.username } });
     });
 });
 
