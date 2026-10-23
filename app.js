@@ -19,8 +19,22 @@ const db = mysql.createConnection({
     database: 'newcontacts'
 });
 
+const authenticateToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    
+    if (!token) return res.status(401).json({ error: 'Acceso denegado' });
+    
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) return res.status(403).json({ error: 'Token inválido' });
+        req.user = user;
+        next();
+    });
+};
+
+
 //? endpoint para obtener datos (con soporte de búsqueda por nombre y apellido)
-app.get('/contacts/staff', (req, res) => {
+app.get('/contacts/staff', authenticateToken, (req, res) => {
     const query = req.query.query;
     const selectQuery = `
         SELECT 
@@ -32,6 +46,8 @@ app.get('/contacts/staff', (req, res) => {
             u.document_type,
             u.document_number,
             CONCAT(u.document_type, u.document_number) AS ci, 
+            u.email,
+            u.username,
             u.date_in,
             p.local_phone,
             p.local_phone AS telefono_local,
@@ -46,20 +62,21 @@ app.get('/contacts/staff', (req, res) => {
             ud.position AS cargo,
             ud.position AS posicion,
             pl.name AS place,
-            pl.name AS lugar
+            pl.name AS lugar,
+            ur.role_id
         FROM users u
-        LEFT JOIN phone_numbers p ON u.id = p.user_id
+        LEFT JOIN user_roles ur ON u.id = ur.user_id
         LEFT JOIN user_departments ud ON u.id = ud.user_id
+          LEFT JOIN phone_numbers p ON ud.id = p.user_department_id
         LEFT JOIN departments d ON ud.department_id = d.id
         LEFT JOIN places pl ON d.place_id = pl.id
         LEFT JOIN user_assigned_lines ual ON u.id = ual.user_id AND ual.return_date IS NULL
-        LEFT JOIN company_lines cl ON ual.line_id = cl.id
-    `;
+        LEFT JOIN company_lines cl ON ual.line_id = cl.id`;
 
     if (query) {
-        const likeQuery = `%${query}%`;
+        const likeQuery = '%' + query + '%';
         db.query(
-            `${selectQuery} WHERE u.name LIKE ? OR u.last_name LIKE ? OR CONCAT(u.name, " ", u.last_name) LIKE ?`,
+            selectQuery + ' WHERE u.name LIKE ? OR u.last_name LIKE ? OR CONCAT(u.name, " ", u.last_name) LIKE ?',
             [likeQuery, likeQuery, likeQuery],
             (err, results) => {
                 if (err) return res.status(500).send(err);
@@ -75,7 +92,7 @@ app.get('/contacts/staff', (req, res) => {
 });
 
 //? endpoint buscar por nombre y apellido
-app.get('/contacts/staff/search/:query', (req, res) => {
+app.get('/contacts/staff/search/:query', authenticateToken, (req, res) => {
     const query = req.params.query;
     const selectQuery = `
         SELECT 
@@ -87,6 +104,8 @@ app.get('/contacts/staff/search/:query', (req, res) => {
             u.document_type,
             u.document_number,
             CONCAT(u.document_type, u.document_number) AS ci, 
+            u.email,
+            u.username,
             u.date_in,
             p.local_phone,
             p.local_phone AS telefono_local,
@@ -101,20 +120,21 @@ app.get('/contacts/staff/search/:query', (req, res) => {
             ud.position AS cargo,
             ud.position AS posicion,
             pl.name AS place,
-            pl.name AS lugar
+            pl.name AS lugar,
+            ur.role_id
         FROM users u
-        LEFT JOIN phone_numbers p ON u.id = p.user_id
+        LEFT JOIN user_roles ur ON u.id = ur.user_id
         LEFT JOIN user_departments ud ON u.id = ud.user_id
+          LEFT JOIN phone_numbers p ON ud.id = p.user_department_id
         LEFT JOIN departments d ON ud.department_id = d.id
         LEFT JOIN places pl ON d.place_id = pl.id
         LEFT JOIN user_assigned_lines ual ON u.id = ual.user_id AND ual.return_date IS NULL
-        LEFT JOIN company_lines cl ON ual.line_id = cl.id
-    `;
+        LEFT JOIN company_lines cl ON ual.line_id = cl.id`;
 
     if (query) {
-        const likeQuery = `%${query}%`;
+        const likeQuery = '%' + query + '%';
         db.query(
-            `${selectQuery} WHERE u.name LIKE ? OR u.last_name LIKE ? OR CONCAT(u.name, " ", u.last_name) LIKE ?`,
+            selectQuery + ' WHERE u.name LIKE ? OR u.last_name LIKE ? OR CONCAT(u.name, " ", u.last_name) LIKE ?',
             [likeQuery, likeQuery, likeQuery],
             (err, results) => {
                 if (err) return res.status(500).send(err);
@@ -130,7 +150,7 @@ app.get('/contacts/staff/search/:query', (req, res) => {
 });
 
 //? endpoint para crear un usuario (soporta /contacts/create y /contacts/staff)
-app.post(['/contacts/create', '/contacts/staff'], (req, res) => {
+app.post(['/contacts/create', '/contacts/staff'], authenticateToken, (req, res) => {
     const {name, last_name, document_type, document_number, email, username, password, date_in, status } = req.body;
     const hashedPassword = password ? bcrypt.hashSync(password, 10) : null;
     db.query('INSERT INTO users (name, last_name, document_type, document_number, email, username, password, date_in, status) VALUES (?,?,?,?,?,?,?,?,?)', [name, last_name, document_type, document_number, email, username, hashedPassword, date_in, status], (err, results) => {
@@ -140,7 +160,7 @@ app.post(['/contacts/create', '/contacts/staff'], (req, res) => {
 });
 
 //? endpoint para actualizar un usuario (soporta /contacts/update/:id y /contacts/staff/:id)
-app.put(['/contacts/update/:id', '/contacts/staff/:id'], (req, res) => {
+app.put(['/contacts/update/:id', '/contacts/staff/:id'], authenticateToken, (req, res) => {
     const id = req.params.id;
     const {name, last_name, document_type, document_number, email, username, password, date_in, status } = req.body;
     db.query('UPDATE users SET name = ?, last_name = ?, document_type = ?, document_number = ?, email = ?, username = ?, password = ?, date_in = ?, status = ? WHERE id = ?', [name,last_name,document_type,document_number,email,username,password,date_in,status, id], (err, results) => {
@@ -150,7 +170,7 @@ app.put(['/contacts/update/:id', '/contacts/staff/:id'], (req, res) => {
 });
 
 //? endpoint para eliminar un usuario (soporta /contacts/delete/:id, /contacts/staff/:id y /contacts/:id)
-app.delete(['/contacts/delete/:id', '/contacts/staff/:id', '/contacts/:id'], (req, res) => {
+app.delete(['/contacts/delete/:id', '/contacts/staff/:id', '/contacts/:id'], authenticateToken, (req, res) => {
     const { id } = req.params;
     db.query('DELETE FROM users WHERE id = ?', [id], (err, results) => {
         if (err) return res.status(500).send(err);
@@ -171,30 +191,24 @@ app.get('/places', (req, res) => {
     db.query('SELECT id, name FROM places;', (err,results) => {
         if (err) return res.status(500).send(err);
         res.json(results);
-    })
+    });
 });
 
 //? endpoint para buscar por lugar
-/* app.get('/contacts/places/:name',(req,results) => {
-    db.query("SELECT u.name AS usuario_nombre, u.last_name AS usuario_apellido,p.local_phone AS telefono_local,p.ext AS extension,d.name AS departamento,pl.name AS lugar FROM users u INNER JOIN phone_numbers p ON u.id = p.user_id INNER JOIN user_departments ud ON u.id = ud.user_id INNER JOIN departments d ON ud.department_id = d.id INNER JOIN places pl ON d.place_id = pl.id  WHERE pl.name = ?", [name],(err, results)=> {
-        if (err) return res.status(500).send(err);
-        res.json(results);
-    })
-}) */
-app.get('/contacts/places/:name', (req, res) => {
-    // 1. Extraer la variable 'name' desde los parámetros de la URL
+app.get('/contacts/places/:name', authenticateToken, (req, res) => {
     const { name } = req.params; 
-
     const query = `
         SELECT 
-            u.id,
-            u.name,
+            u.id, 
+            u.name, 
             u.name AS usuario_nombre,
-            u.last_name,
+            u.last_name, 
             u.last_name AS usuario_apellido,
             u.document_type,
             u.document_number,
-            CONCAT(u.document_type, u.document_number) AS ci,
+            CONCAT(u.document_type, u.document_number) AS ci, 
+            u.email,
+            u.username,
             u.date_in,
             p.local_phone,
             p.local_phone AS telefono_local,
@@ -208,21 +222,21 @@ app.get('/contacts/places/:name', (req, res) => {
             ud.position,
             ud.position AS cargo,
             ud.position AS posicion,
-            pl.name AS lugar 
-        FROM users u 
-        INNER JOIN phone_numbers p ON u.id = p.user_id 
-        INNER JOIN user_departments ud ON u.id = ud.user_id 
+            pl.name AS place,
+            pl.name AS lugar,
+            ur.role_id
+        FROM users u
+        LEFT JOIN user_roles ur ON u.id = ur.user_id
+        INNER JOIN user_departments ud ON u.id = ud.user_id
+          INNER JOIN phone_numbers p ON ud.id = p.user_department_id 
         INNER JOIN departments d ON ud.department_id = d.id 
         INNER JOIN places pl ON d.place_id = pl.id  
         LEFT JOIN user_assigned_lines ual ON u.id = ual.user_id AND ual.return_date IS NULL
-        LEFT JOIN company_lines cl ON ual.line_id = cl.id
-        WHERE pl.name = ?
-    `;
+        LEFT JOIN company_lines cl ON ual.line_id = cl.id WHERE pl.name = ?`;
 
-    // 2. Usar la variable 'name' y cambiar el nombre del segundo parámetro del callback a 'rows' o 'data'
     db.query(query, [name], (err, rows) => {
         if (err) {
-            console.error(err); // Es buena práctica imprimir el error en consola para debugging
+            console.error(err);
             return res.status(500).json({ error: "Error en la base de datos", details: err });
         }
         res.json(rows);
@@ -230,7 +244,7 @@ app.get('/contacts/places/:name', (req, res) => {
 });
 
 //? endpoint para crear un contacto completo (users, phone_numbers, user_departments)
-app.post('/contacts/create-full', (req, res) => {
+app.post('/contacts/create-full', authenticateToken, (req, res) => {
     const {
         name,
         last_name,
@@ -245,7 +259,8 @@ app.post('/contacts/create-full', (req, res) => {
         position,
         email,
         username,
-        password
+        password,
+        role_id
     } = req.body;
 
     let doc_type = document_type || 'V';
@@ -278,58 +293,71 @@ app.post('/contacts/create-full', (req, res) => {
 
             const userId = userResult.insertId;
 
-            // 2. Insert into phone_numbers
-            const phoneQuery = 'INSERT INTO phone_numbers (user_id, local_phone) VALUES (?, ?)';
-            db.query(phoneQuery, [userId, local_phone || null], (err) => {
+            // 2. Insert into user_departments
+            const deptQuery = 'INSERT INTO user_departments (user_id, department_id, position) VALUES (?, ?, ?)';
+            db.query(deptQuery, [userId, department_id || null, position || ''], (err, deptRes) => {
                 if (err) {
-                    console.error("Failed to insert phone numbers:", err);
+                    console.error("Failed to insert user department:", err);
                     return db.rollback(() => {
-                        res.status(500).json({ error: "Failed to insert phone numbers", details: err });
+                        res.status(500).json({ error: "Failed to insert user department", details: err });
                     });
                 }
+                
+                const userDeptId = deptRes.insertId;
 
-                // 3. Insert into user_departments
-                const deptQuery = 'INSERT INTO user_departments (user_id, department_id, position) VALUES (?, ?, ?)';
-                db.query(deptQuery, [userId, department_id || null, position || ''], (err) => {
+                // 3. Insert into phone_numbers
+                const phoneQuery = 'INSERT INTO phone_numbers (user_department_id, local_phone) VALUES (?, ?)';
+                db.query(phoneQuery, [userDeptId, local_phone || null], (err) => {
                     if (err) {
-                        console.error("Failed to insert user department:", err);
+                        console.error("Failed to insert phone numbers:", err);
                         return db.rollback(() => {
-                            res.status(500).json({ error: "Failed to insert user department", details: err });
+                            res.status(500).json({ error: "Failed to insert phone numbers", details: err });
                         });
                     }
 
-                    const assignLine = () => {
-                        if (!cell_phone) return commitTx();
-                        
-                        const assignQuery = 'INSERT INTO user_assigned_lines (user_id, line_id, assigned_date) VALUES (?, ?, CURDATE())';
-                        db.query(assignQuery, [userId, cell_phone], (err) => {
-                            if (err) {
-                                console.error("Failed to assign company line:", err);
-                                return db.rollback(() => res.status(500).json({ error: "Failed to assign line", details: err }));
-                            }
-
-                            const updateLineQuery = "UPDATE company_lines SET status = 'asignado' WHERE id = ?";
-                            db.query(updateLineQuery, [cell_phone], (err) => {
-                                if (err) {
-                                    console.error("Failed to update company line status:", err);
-                                    return db.rollback(() => res.status(500).json({ error: "Failed to update line status", details: err }));
-                                }
-                                commitTx();
+                    // 4. Insert into user_roles
+                    const roleQuery = 'INSERT INTO user_roles (user_id, role_id) VALUES (?, ?)';
+                    db.query(roleQuery, [userId, role_id || 4], (err) => {
+                        if (err) {
+                            console.error("Failed to insert user roles:", err);
+                            return db.rollback(() => {
+                                res.status(500).json({ error: "Failed to insert user roles", details: err });
                             });
-                        });
-                    };
+                        }
 
-                    const commitTx = () => {
-                        db.commit((err) => {
-                            if (err) {
-                                console.error("Failed to commit transaction:", err);
-                                return db.rollback(() => res.status(500).json({ error: "Failed to commit transaction", details: err }));
-                            }
-                            res.status(201).json({ success: true, userId });
-                        });
-                    };
+                        const assignLine = () => {
+                            if (!cell_phone) return commitTx();
+                            
+                            const assignQuery = 'INSERT INTO user_assigned_lines (user_id, line_id, assigned_date) VALUES (?, ?, CURDATE())';
+                            db.query(assignQuery, [userId, cell_phone], (err) => {
+                                if (err) {
+                                    console.error("Failed to assign company line:", err);
+                                    return db.rollback(() => res.status(500).json({ error: "Failed to assign line", details: err }));
+                                }
 
-                    assignLine();
+                                const updateLineQuery = "UPDATE company_lines SET status = 'asignado' WHERE id = ?";
+                                db.query(updateLineQuery, [cell_phone], (err) => {
+                                    if (err) {
+                                        console.error("Failed to update company line status:", err);
+                                        return db.rollback(() => res.status(500).json({ error: "Failed to update line status", details: err }));
+                                    }
+                                    commitTx();
+                                });
+                            });
+                        };
+
+                        const commitTx = () => {
+                            db.commit((err) => {
+                                if (err) {
+                                    console.error("Failed to commit transaction:", err);
+                                    return db.rollback(() => res.status(500).json({ error: "Failed to commit transaction", details: err }));
+                                }
+                                res.status(201).json({ success: true, userId });
+                            });
+                        };
+
+                        assignLine();
+                    });
                 });
             });
         });
@@ -337,7 +365,7 @@ app.post('/contacts/create-full', (req, res) => {
 });
 
 //? endpoint para actualizar un contacto completo (users, phone_numbers, user_departments)
-app.put('/contacts/update-full/:id', (req, res) => {
+app.put('/contacts/update-full/:id', authenticateToken, (req, res) => {
     const id = req.params.id;
     const {
         name,
@@ -350,7 +378,11 @@ app.put('/contacts/update-full/:id', (req, res) => {
         cell_phone,
         ext,
         department_id,
-        position
+        position,
+        email,
+        username,
+        password,
+        role_id
     } = req.body;
 
     let doc_type = document_type || 'V';
@@ -370,8 +402,26 @@ app.put('/contacts/update-full/:id', (req, res) => {
         }
 
         // 1. Update users table
-        const userQuery = 'UPDATE users SET name = ?, last_name = ?, document_type = ?, document_number = ?, date_in = ? WHERE id = ?';
-        db.query(userQuery, [name, last_name, doc_type, doc_number || null, date_in || null, id], (err) => {
+        let userQuery = 'UPDATE users SET name = ?, last_name = ?, document_type = ?, document_number = ?, date_in = ?';
+        let queryParams = [name, last_name, doc_type, doc_number || null, date_in || null];
+        
+        if (email !== undefined) {
+            userQuery += ', email = ?';
+            queryParams.push(email || null);
+        }
+        if (username !== undefined) {
+            userQuery += ', username = ?';
+            queryParams.push(username || null);
+        }
+        if (password) {
+            userQuery += ', password = ?';
+            queryParams.push(bcrypt.hashSync(password, 10));
+        }
+        
+        userQuery += ' WHERE id = ?';
+        queryParams.push(id);
+
+        db.query(userQuery, queryParams, (err) => {
             if (err) {
                 console.error("Failed to update user:", err);
                 return db.rollback(() => {
@@ -379,41 +429,57 @@ app.put('/contacts/update-full/:id', (req, res) => {
                 });
             }
 
-            // 2. Update phone_numbers table
-            const phoneQuery = `
-                INSERT INTO phone_numbers (user_id, local_phone) 
-                VALUES (?, ?)
-                ON DUPLICATE KEY UPDATE 
-                    local_phone = VALUES(local_phone)
-            `;
-            db.query(phoneQuery, [id, local_phone || null], (err) => {
+            // 2. Clear old user departments (this cascades to phone_numbers)
+            const deleteDeptQuery = 'DELETE FROM user_departments WHERE user_id = ?';
+            db.query(deleteDeptQuery, [id], (err) => {
                 if (err) {
-                    console.error("Failed to update phone numbers:", err);
+                    console.error("Failed to clear user departments:", err);
                     return db.rollback(() => {
-                        res.status(500).json({ error: "Failed to update phone numbers", details: err });
+                        res.status(500).json({ error: "Failed to clear user departments", details: err });
                     });
                 }
 
-                // 3. Update user_departments table
-                const deleteDeptQuery = 'DELETE FROM user_departments WHERE user_id = ?';
-                db.query(deleteDeptQuery, [id], (err) => {
+                // 3. Insert new user department
+                const insertDeptQuery = 'INSERT INTO user_departments (user_id, department_id, position) VALUES (?, ?, ?)';
+                db.query(insertDeptQuery, [id, department_id || null, position || ''], (err, deptRes) => {
                     if (err) {
-                        console.error("Failed to clear user departments:", err);
+                        console.error("Failed to insert user department:", err);
                         return db.rollback(() => {
-                            res.status(500).json({ error: "Failed to clear user departments", details: err });
+                            res.status(500).json({ error: "Failed to insert user department", details: err });
                         });
                     }
 
-                    const insertDeptQuery = 'INSERT INTO user_departments (user_id, department_id, position) VALUES (?, ?, ?)';
-                    db.query(insertDeptQuery, [id, department_id || null, position || ''], (err) => {
+                    const userDeptId = deptRes.insertId;
+
+                    // 4. Insert new phone number
+                    const phoneQuery = 'INSERT INTO phone_numbers (user_department_id, local_phone) VALUES (?, ?)';
+                    db.query(phoneQuery, [userDeptId, local_phone || null], (err) => {
                         if (err) {
-                            console.error("Failed to insert user department:", err);
+                            console.error("Failed to insert phone numbers:", err);
                             return db.rollback(() => {
-                                res.status(500).json({ error: "Failed to insert user department", details: err });
+                                res.status(500).json({ error: "Failed to insert phone numbers", details: err });
                             });
                         }
 
-                        const updateLineAssignment = () => {
+                        // 5. Update user roles (assuming one role per user for now, or updating the primary role)
+                        // Wait, update-full doesn't receive role_id in req.body currently. Let's extract it if provided.
+                        const role_id = req.body.role_id;
+                        const updateRole = (callback) => {
+                            if (role_id) {
+                                db.query('DELETE FROM user_roles WHERE user_id = ?', [id], (err) => {
+                                    if (err) return db.rollback(() => res.status(500).json({ error: "Failed to clear user roles", details: err }));
+                                    db.query('INSERT INTO user_roles (user_id, role_id) VALUES (?, ?)', [id, role_id], (err) => {
+                                        if (err) return db.rollback(() => res.status(500).json({ error: "Failed to insert user role", details: err }));
+                                        callback();
+                                    });
+                                });
+                            } else {
+                                callback();
+                            }
+                        };
+
+                        updateRole(() => {
+                            const updateLineAssignment = () => {
                             // Check current active line
                             db.query('SELECT id, line_id FROM user_assigned_lines WHERE user_id = ? AND return_date IS NULL', [id], (err, currentLineRes) => {
                                 if (err) {
@@ -480,13 +546,55 @@ app.put('/contacts/update-full/:id', (req, res) => {
         });
     });
 });
+});
 
 //? endpoint ver las lista de las lineas de compañia disponibles
-app.get('/contacts/company-lines/available', (req, res) => {
+app.get('/contacts/company-lines/available', authenticateToken, (req, res) => {
     db.query("SELECT id, phone_number, operator FROM company_lines WHERE status = 'disponible' AND active_status = 'activa'", (err, results) => {
         if (err) return res.status(500).send(err);
         res.json(results);
     });
+});
+
+//? endpoint para obtener todas las líneas de compañía con usuario asignado
+app.get('/company-lines', authenticateToken, (req, res) => {
+    const query = `
+        SELECT 
+            cl.id,
+            cl.serial,
+            cl.phone_number,
+            cl.status,
+            cl.active_status,
+            cl.operator,
+            cl.created_at,
+            cl.updated_at,
+            ual.user_id,
+            u.name AS user_name,
+            u.last_name AS user_last_name,
+            CONCAT(u.name, ' ', u.last_name) AS assigned_user,
+            ual.assigned_date
+        FROM company_lines cl
+        LEFT JOIN user_assigned_lines ual ON cl.id = ual.line_id AND ual.return_date IS NULL
+        LEFT JOIN users u ON ual.user_id = u.id
+        ORDER BY cl.id DESC
+    `;
+    db.query(query, (err, results) => {
+        if (err) return res.status(500).json({ error: 'Error al consultar líneas', details: err });
+        res.json(results);
+    });
+});
+
+//? endpoint para crear una nueva línea
+app.post('/company-lines/create-line', authenticateToken, (req, res) => {
+    const { serial, phone_number, status, active_status, operator } = req.body;
+    db.query(
+        'INSERT INTO company_lines (serial, phone_number, status, active_status, operator) VALUES (?, ?, ?, ?, ?)',
+        [serial, phone_number, status || 'disponible', active_status || 'activa', operator],
+        (err, results) => {
+            if (err) return res.status(500).json({ error: 'Error al crear la línea', details: err });
+            res.status(201).json({ success: true, insertId: results.insertId });
+        }
+    );
 });
 
 //? endpoint de login
@@ -497,7 +605,12 @@ app.post('/api/auth/login', (req, res) => {
         return res.status(400).json({ error: 'Usuario y contraseña son requeridos' });
     }
 
-    db.query('SELECT * FROM users WHERE username = ?', [username], (err, results) => {
+    db.query(`
+        SELECT u.*, ur.role_id 
+        FROM users u 
+        LEFT JOIN user_roles ur ON u.id = ur.user_id 
+        WHERE u.username = ?
+    `, [username], (err, results) => {
         if (err) return res.status(500).json({ error: 'Error en la base de datos' });
         
         if (results.length === 0) {
@@ -516,12 +629,12 @@ app.post('/api/auth/login', (req, res) => {
         }
 
         const token = jwt.sign(
-            { id: user.id, username: user.username, role: 'admin' }, 
+            { id: user.id, username: user.username, role_id: user.role_id }, 
             JWT_SECRET, 
             { expiresIn: '8h' }
         );
 
-        res.json({ success: true, token, user: { id: user.id, name: user.name, username: user.username } });
+        res.json({ success: true, token, user: { id: user.id, name: user.name, username: user.username, role_id: user.role_id } });
     });
 });
 
