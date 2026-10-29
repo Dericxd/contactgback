@@ -32,6 +32,16 @@ const authenticateToken = (req, res, next) => {
     });
 };
 
+const requireRole = (allowedRoles) => {
+    return (req, res, next) => {
+        const userRole = req.user && req.user.role_id ? Number(req.user.role_id) : null;
+        if (!userRole || !allowedRoles.includes(userRole)) {
+            return res.status(403).json({ error: 'Acceso denegado: permisos insuficientes' });
+        }
+        next();
+    };
+};
+
 
 //? endpoint para obtener datos (con soporte de búsqueda por nombre y apellido)
 app.get('/contacts/staff', authenticateToken, (req, res) => {
@@ -186,6 +196,133 @@ app.get('/departments', (req, res) => {
     });
 });
 
+//? endpoint para obtener la lista de departamentos activos (status = 1) con nombre de lugar (roles 1, 2, 3) (soporta paginación)
+app.get('/contacts/departments', authenticateToken, requireRole([1, 2, 3]), (req, res) => {
+    const { page, limit, search, place_id } = req.query;
+
+    let whereClause = 'WHERE d.status = 1';
+    const params = [];
+
+    if (place_id && place_id !== 'todos') {
+        whereClause += ' AND d.place_id = ?';
+        params.push(Number(place_id));
+    }
+
+    if (search && search.trim()) {
+        const like = '%' + search.trim() + '%';
+        whereClause += ' AND (d.name LIKE ? OR pl.name LIKE ?)';
+        params.push(like, like);
+    }
+
+    // Si no se pide paginación, devolver el listado completo (compatibilidad)
+    if (!page) {
+        const query = `
+            SELECT d.id, d.name, d.place_id, pl.name AS place_name, d.status, d.created_at, d.updated_at 
+            FROM departments d 
+            INNER JOIN places pl ON d.place_id = pl.id 
+            ${whereClause} 
+            ORDER BY d.name ASC
+        `;
+        db.query(query, params, (err, results) => {
+            if (err) return res.status(500).json({ error: 'Error al consultar departamentos', details: err });
+            res.json(results);
+        });
+        return;
+    }
+
+    // Modo paginado
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.max(1, Math.min(100, parseInt(limit, 10) || 10));
+    const offset = (pageNum - 1) * limitNum;
+
+    const countQuery = `
+        SELECT COUNT(*) AS total 
+        FROM departments d 
+        INNER JOIN places pl ON d.place_id = pl.id 
+        ${whereClause}
+    `;
+
+    db.query(countQuery, params, (countErr, countResults) => {
+        if (countErr) return res.status(500).json({ error: 'Error al contar departamentos', details: countErr });
+
+        const total = countResults[0].total;
+        const totalPages = Math.ceil(total / limitNum);
+
+        const dataQuery = `
+            SELECT d.id, d.name, d.place_id, pl.name AS place_name, d.status, d.created_at, d.updated_at 
+            FROM departments d 
+            INNER JOIN places pl ON d.place_id = pl.id 
+            ${whereClause} 
+            ORDER BY d.name ASC 
+            LIMIT ? OFFSET ?
+        `;
+
+        db.query(dataQuery, [...params, limitNum, offset], (dataErr, rows) => {
+            if (dataErr) return res.status(500).json({ error: 'Error al obtener departamentos', details: dataErr });
+            res.json({
+                data: rows,
+                total,
+                page: pageNum,
+                limit: limitNum,
+                totalPages
+            });
+        });
+    });
+});
+
+//? endpoint para crear un departamento (roles 1, 2, 3)
+app.post('/contacts/departments', authenticateToken, requireRole([1, 2, 3]), (req, res) => {
+    const { name, place_id, status } = req.body;
+    if (!name || !place_id) {
+        return res.status(400).json({ error: 'El nombre y el lugar son requeridos' });
+    }
+
+    const deptStatus = status !== undefined ? Number(status) : 1;
+
+    db.query(
+        'INSERT INTO departments (name, place_id, status) VALUES (?, ?, ?)',
+        [name.trim(), Number(place_id), deptStatus],
+        (err, results) => {
+            if (err) {
+                if (err.code === 'ER_DUP_ENTRY') {
+                    return res.status(409).json({ error: 'Ya existe un departamento con ese nombre en esta sede/lugar' });
+                }
+                return res.status(500).json({ error: 'Error al crear departamento', details: err });
+            }
+            res.status(201).json({ success: true, insertId: results.insertId, message: 'Departamento creado con éxito' });
+        }
+    );
+});
+
+//? endpoint para actualizar/modificar un departamento (roles 1, 2, 3)
+app.put('/contacts/departments/:id', authenticateToken, requireRole([1, 2, 3]), (req, res) => {
+    const id = Number(req.params.id);
+    const { name, place_id, status } = req.body;
+
+    if (!id || !name || !place_id) {
+        return res.status(400).json({ error: 'ID, nombre y lugar son requeridos' });
+    }
+
+    const deptStatus = status !== undefined ? Number(status) : 1;
+
+    db.query(
+        'UPDATE departments SET name = ?, place_id = ?, status = ? WHERE id = ?',
+        [name.trim(), Number(place_id), deptStatus, id],
+        (err, results) => {
+            if (err) {
+                if (err.code === 'ER_DUP_ENTRY') {
+                    return res.status(409).json({ error: 'Ya existe un departamento con ese nombre en esta sede/lugar' });
+                }
+                return res.status(500).json({ error: 'Error al actualizar departamento', details: err });
+            }
+            if (results.affectedRows === 0) {
+                return res.status(404).json({ error: 'Departamento no encontrado' });
+            }
+            res.json({ success: true, message: 'Departamento actualizado con éxito' });
+        }
+    );
+});
+
 //? endpoint para obtener el lugar (incluye id y name)
 app.get('/places', (req, res) => {
     db.query('SELECT id, name FROM places;', (err,results) => {
@@ -194,52 +331,139 @@ app.get('/places', (req, res) => {
     });
 });
 
-//? endpoint para buscar por lugar
+//? endpoint para buscar por lugar (soporta paginación y búsqueda)
 app.get('/contacts/places/:name', authenticateToken, (req, res) => {
-    const { name } = req.params; 
-    const query = `
-        SELECT 
-            u.id, 
-            u.name, 
-            u.name AS usuario_nombre,
-            u.last_name, 
-            u.last_name AS usuario_apellido,
-            u.document_type,
-            u.document_number,
-            CONCAT(u.document_type, u.document_number) AS ci, 
-            u.email,
-            u.username,
-            u.date_in,
-            p.local_phone,
-            p.local_phone AS telefono_local,
-            cl.id AS line_id,
-            cl.phone_number AS cell_phone,
-            cl.phone_number AS telefono_personal,
-            p.ext,
-            p.ext AS extension,
-            d.name AS department,
-            d.name AS departamento,
-            ud.position,
-            ud.position AS cargo,
-            ud.position AS posicion,
-            pl.name AS place,
-            pl.name AS lugar,
-            ur.role_id
+    const { name } = req.params;
+    const { page, limit, search } = req.query;
+
+    const baseFrom = `
         FROM users u
         LEFT JOIN user_roles ur ON u.id = ur.user_id
         INNER JOIN user_departments ud ON u.id = ud.user_id
-          INNER JOIN phone_numbers p ON ud.id = p.user_department_id 
+        INNER JOIN phone_numbers p ON ud.id = p.user_department_id 
         INNER JOIN departments d ON ud.department_id = d.id 
         INNER JOIN places pl ON d.place_id = pl.id  
         LEFT JOIN user_assigned_lines ual ON u.id = ual.user_id AND ual.return_date IS NULL
-        LEFT JOIN company_lines cl ON ual.line_id = cl.id WHERE pl.name = ?`;
+        LEFT JOIN company_lines cl ON ual.line_id = cl.id
+    `;
 
-    db.query(query, [name], (err, rows) => {
-        if (err) {
-            console.error(err);
-            return res.status(500).json({ error: "Error en la base de datos", details: err });
+    let whereClause = 'WHERE pl.name = ?';
+    const params = [name];
+
+    if (search && search.trim()) {
+        const like = '%' + search.trim() + '%';
+        whereClause += ' AND (u.name LIKE ? OR u.last_name LIKE ? OR CONCAT(u.name, " ", u.last_name) LIKE ? OR d.name LIKE ? OR ud.position LIKE ? OR p.local_phone LIKE ? OR cl.phone_number LIKE ?)';
+        params.push(like, like, like, like, like, like, like);
+    }
+
+    // Si no se pide paginación, devolver el listado completo (compatibilidad)
+    if (!page) {
+        const selectQuery = `
+            SELECT 
+                u.id, 
+                u.name, 
+                u.name AS usuario_nombre,
+                u.last_name, 
+                u.last_name AS usuario_apellido,
+                u.document_type,
+                u.document_number,
+                CONCAT(u.document_type, u.document_number) AS ci, 
+                u.email,
+                u.username,
+                u.date_in,
+                p.local_phone,
+                p.local_phone AS telefono_local,
+                cl.id AS line_id,
+                cl.phone_number AS cell_phone,
+                cl.phone_number AS telefono_personal,
+                p.ext,
+                p.ext AS extension,
+                d.name AS department,
+                d.name AS departamento,
+                ud.position,
+                ud.position AS cargo,
+                ud.position AS posicion,
+                pl.name AS place,
+                pl.name AS lugar,
+                ur.role_id
+            ${baseFrom}
+            ${whereClause}
+            ORDER BY u.name ASC
+        `;
+
+        db.query(selectQuery, params, (err, rows) => {
+            if (err) {
+                console.error(err);
+                return res.status(500).json({ error: "Error en la base de datos", details: err });
+            }
+            res.json(rows);
+        });
+        return;
+    }
+
+    // Modo paginado
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.max(1, Math.min(100, parseInt(limit, 10) || 10));
+    const offset = (pageNum - 1) * limitNum;
+
+    const countQuery = `SELECT COUNT(*) AS total ${baseFrom} ${whereClause}`;
+
+    db.query(countQuery, params, (countErr, countResults) => {
+        if (countErr) {
+            console.error(countErr);
+            return res.status(500).json({ error: "Error al contar personal", details: countErr });
         }
-        res.json(rows);
+
+        const total = countResults[0].total;
+        const totalPages = Math.ceil(total / limitNum);
+
+        const dataQuery = `
+            SELECT 
+                u.id, 
+                u.name, 
+                u.name AS usuario_nombre,
+                u.last_name, 
+                u.last_name AS usuario_apellido,
+                u.document_type,
+                u.document_number,
+                CONCAT(u.document_type, u.document_number) AS ci, 
+                u.email,
+                u.username,
+                u.date_in,
+                p.local_phone,
+                p.local_phone AS telefono_local,
+                cl.id AS line_id,
+                cl.phone_number AS cell_phone,
+                cl.phone_number AS telefono_personal,
+                p.ext,
+                p.ext AS extension,
+                d.name AS department,
+                d.name AS departamento,
+                ud.position,
+                ud.position AS cargo,
+                ud.position AS posicion,
+                pl.name AS place,
+                pl.name AS lugar,
+                ur.role_id
+            ${baseFrom}
+            ${whereClause}
+            ORDER BY u.name ASC
+            LIMIT ? OFFSET ?
+        `;
+
+        db.query(dataQuery, [...params, limitNum, offset], (dataErr, rows) => {
+            if (dataErr) {
+                console.error(dataErr);
+                return res.status(500).json({ error: "Error al obtener personal", details: dataErr });
+            }
+            res.json({
+                data: rows,
+                total,
+                page: pageNum,
+                limit: limitNum,
+                totalPages
+            });
+        });
     });
 });
 
@@ -556,43 +780,148 @@ app.get('/contacts/company-lines/available', authenticateToken, (req, res) => {
     });
 });
 
-//? endpoint para obtener todas las líneas de compañía con usuario asignado
+//? endpoint para obtener todas las líneas de compañía con usuario asignado (soporta paginación)
 app.get('/company-lines', authenticateToken, (req, res) => {
-    const query = `
-        SELECT 
-            cl.id,
-            cl.serial,
-            cl.phone_number,
-            cl.status,
-            cl.active_status,
-            cl.operator,
-            cl.created_at,
-            cl.updated_at,
-            ual.user_id,
-            u.name AS user_name,
-            u.last_name AS user_last_name,
-            CONCAT(u.name, ' ', u.last_name) AS assigned_user,
-            ual.assigned_date
+    const { page, limit, operator, search } = req.query;
+
+    const baseFrom = `
         FROM company_lines cl
         LEFT JOIN user_assigned_lines ual ON cl.id = ual.line_id AND ual.return_date IS NULL
         LEFT JOIN users u ON ual.user_id = u.id
-        ORDER BY cl.id DESC
     `;
-    db.query(query, (err, results) => {
-        if (err) return res.status(500).json({ error: 'Error al consultar líneas', details: err });
-        res.json(results);
+
+    const whereClauses = [];
+    const params = [];
+
+    if (operator && operator.toLowerCase() !== 'todos') {
+        whereClauses.push('LOWER(cl.operator) = LOWER(?)');
+        params.push(operator.trim());
+    }
+
+    if (search && search.trim()) {
+        const like = '%' + search.trim() + '%';
+        whereClauses.push('(cl.phone_number LIKE ? OR cl.serial LIKE ? OR cl.operator LIKE ? OR cl.status LIKE ? OR cl.active_status LIKE ? OR u.name LIKE ? OR u.last_name LIKE ? OR CONCAT(u.name, " ", u.last_name) LIKE ?)');
+        params.push(like, like, like, like, like, like, like, like);
+    }
+
+    const whereSQL = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+
+    // Si no se pide paginación, devolver el listado completo (compatibilidad)
+    if (!page) {
+        const query = `
+            SELECT 
+                cl.id,
+                cl.serial,
+                cl.phone_number,
+                cl.status,
+                cl.active_status,
+                cl.operator,
+                cl.created_at,
+                cl.updated_at,
+                ual.user_id,
+                u.name AS user_name,
+                u.last_name AS user_last_name,
+                CONCAT(u.name, ' ', u.last_name) AS assigned_user,
+                ual.assigned_date
+            ${baseFrom}
+            ${whereSQL}
+            ORDER BY cl.id DESC
+        `;
+        db.query(query, params, (err, results) => {
+            if (err) return res.status(500).json({ error: 'Error al consultar líneas', details: err });
+            res.json(results);
+        });
+        return;
+    }
+
+    // Modo paginado
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.max(1, Math.min(100, parseInt(limit, 10) || 10));
+    const offset = (pageNum - 1) * limitNum;
+
+    const countQuery = `SELECT COUNT(*) AS total ${baseFrom} ${whereSQL}`;
+
+    db.query(countQuery, params, (countErr, countResults) => {
+        if (countErr) return res.status(500).json({ error: 'Error al contar líneas', details: countErr });
+
+        const total = countResults[0].total;
+        const totalPages = Math.ceil(total / limitNum);
+
+        const dataQuery = `
+            SELECT 
+                cl.id,
+                cl.serial,
+                cl.phone_number,
+                cl.status,
+                cl.active_status,
+                cl.operator,
+                cl.created_at,
+                cl.updated_at,
+                ual.user_id,
+                u.name AS user_name,
+                u.last_name AS user_last_name,
+                CONCAT(u.name, ' ', u.last_name) AS assigned_user,
+                ual.assigned_date
+            ${baseFrom}
+            ${whereSQL}
+            ORDER BY cl.id DESC
+            LIMIT ? OFFSET ?
+        `;
+
+        db.query(dataQuery, [...params, limitNum, offset], (dataErr, rows) => {
+            if (dataErr) return res.status(500).json({ error: 'Error al obtener líneas', details: dataErr });
+            res.json({
+                data: rows,
+                total,
+                page: pageNum,
+                limit: limitNum,
+                totalPages
+            });
+        });
     });
 });
 
-//? endpoint para crear una nueva línea
-app.post('/company-lines/create-line', authenticateToken, (req, res) => {
+//? endpoint para crear una nueva línea (roles 1, 2, 3)
+app.post('/company-lines/create-line', authenticateToken, requireRole([1, 2, 3]), (req, res) => {
     const { serial, phone_number, status, active_status, operator } = req.body;
     db.query(
         'INSERT INTO company_lines (serial, phone_number, status, active_status, operator) VALUES (?, ?, ?, ?, ?)',
         [serial, phone_number, status || 'disponible', active_status || 'activa', operator],
         (err, results) => {
-            if (err) return res.status(500).json({ error: 'Error al crear la línea', details: err });
+            if (err) {
+                if (err.code === 'ER_DUP_ENTRY') {
+                    return res.status(409).json({ error: 'Ya existe una línea con ese serial o número telefónico' });
+                }
+                return res.status(500).json({ error: 'Error al crear la línea', details: err });
+            }
             res.status(201).json({ success: true, insertId: results.insertId });
+        }
+    );
+});
+
+//? endpoint para actualizar/modificar una línea (roles 1, 2, 3)
+app.put('/company-lines/:id', authenticateToken, requireRole([1, 2, 3]), (req, res) => {
+    const id = Number(req.params.id);
+    const { serial, phone_number, status, active_status, operator } = req.body;
+
+    if (!id || !serial || !phone_number || !operator) {
+        return res.status(400).json({ error: 'ID, serial, número y operador son requeridos' });
+    }
+
+    db.query(
+        'UPDATE company_lines SET serial = ?, phone_number = ?, status = ?, active_status = ?, operator = ? WHERE id = ?',
+        [serial.trim(), phone_number.trim(), status || 'disponible', active_status || 'activa', operator, id],
+        (err, results) => {
+            if (err) {
+                if (err.code === 'ER_DUP_ENTRY') {
+                    return res.status(409).json({ error: 'Ya existe una línea con ese serial o número telefónico' });
+                }
+                return res.status(500).json({ error: 'Error al actualizar la línea', details: err });
+            }
+            if (results.affectedRows === 0) {
+                return res.status(404).json({ error: 'Línea corporativa no encontrada' });
+            }
+            res.json({ success: true, message: 'Línea corporativa actualizada con éxito' });
         }
     );
 });
