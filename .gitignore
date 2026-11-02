@@ -1,0 +1,5 @@
+# Secretos y configuración local
+.env
+
+# Respaldos de base de datos (contienen datos y hashes)
+migrations/backup_*.sql

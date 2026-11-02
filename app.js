@@ -1,206 +1,519 @@
 const express = require('express');
-const mysql = require('mysql2');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 
-const port = 3000;
+const config = require('./config');
+const {
+    pool,
+    parseId,
+    invalidate,
+    authenticate,
+    requirePermission,
+    requireAdmin,
+    getTargetUser,
+    canManageTarget,
+    resolveAssignableRole,
+    getDefaultRoleId
+} = require('./access');
+const permissionsRoutes = require('./permissions.routes');
 
 const app = express();
-app.use(cors());
+
+// Seguridad HTTP con Helmet
+app.use(helmet());
+
+// CORS restrictivo a orígenes configurados
+app.use(cors({
+    origin: (origin, callback) => {
+        // Permitir solicitudes sin origen (como Postman o scripts locales de test) o si está en la lista blanca
+        if (!origin || config.corsOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            callback(new Error('No permitido por la política CORS'));
+        }
+    },
+    credentials: true
+}));
+
 app.use(express.json());
 
-const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_key_123';
-
-const db = mysql.createConnection({
-    host: 'localhost',
-    user: 'root',
-    password: 'qweasdzxc0*',
-    database: 'newcontacts'
+// Rate limit para inicio de sesión (15 intentos por ventana de 15 minutos)
+const loginLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 15,
+    message: { error: 'Demasiados intentos de inicio de sesión. Por favor, intente de nuevo más tarde.' },
+    standardHeaders: true,
+    legacyHeaders: false,
 });
 
-const authenticateToken = (req, res, next) => {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-    
-    if (!token) return res.status(401).json({ error: 'Acceso denegado' });
-    
-    jwt.verify(token, JWT_SECRET, (err, user) => {
-        if (err) return res.status(403).json({ error: 'Token inválido' });
-        req.user = user;
-        next();
-    });
-};
+// Registrar rutas de permisos
+app.use(permissionsRoutes);
 
-const requireRole = (allowedRoles) => {
-    return (req, res, next) => {
-        const userRole = req.user && req.user.role_id ? Number(req.user.role_id) : null;
-        if (!userRole || !allowedRoles.includes(userRole)) {
-            return res.status(403).json({ error: 'Acceso denegado: permisos insuficientes' });
+//? -------------------------------------------------------------
+//? ENDPOINT DE AUTENTICACIÓN (LOGIN)
+//? -------------------------------------------------------------
+app.post('/api/auth/login', loginLimiter, async (req, res) => {
+    const { username, password } = req.body;
+
+    if (!username || !password) {
+        return res.status(400).json({ error: 'Usuario y contraseña son requeridos' });
+    }
+
+    try {
+        const [results] = await pool.query(`
+            SELECT u.*, ur.role_id, r.slug AS role_slug, r.name AS role_name
+            FROM users u
+            LEFT JOIN user_roles ur ON u.id = ur.user_id AND ur.deleted_at IS NULL
+            LEFT JOIN roles r ON ur.role_id = r.id AND r.status = 1 AND r.deleted_at IS NULL
+            WHERE u.username = ? AND u.status = 1 AND u.deleted_at IS NULL
+        `, [username.trim()]);
+
+        if (results.length === 0) {
+            return res.status(401).json({ error: 'Credenciales inválidas' });
         }
-        next();
-    };
-};
 
+        const user = results[0];
 
-//? endpoint para obtener datos (con soporte de búsqueda por nombre y apellido)
-app.get('/contacts/staff', authenticateToken, (req, res) => {
-    const query = req.query.query;
-    const selectQuery = `
-        SELECT 
-            u.id, 
-            u.name, 
-            u.name AS usuario_nombre,
-            u.last_name, 
-            u.last_name AS usuario_apellido,
-            u.document_type,
-            u.document_number,
-            CONCAT(u.document_type, u.document_number) AS ci, 
-            u.email,
-            u.username,
-            u.date_in,
-            p.local_phone,
-            p.local_phone AS telefono_local,
-            cl.id AS line_id,
-            cl.phone_number AS cell_phone,
-            cl.phone_number AS telefono_personal,
-            p.ext,
-            p.ext AS extension,
-            d.name AS department,
-            d.name AS departamento,
-            ud.position,
-            ud.position AS cargo,
-            ud.position AS posicion,
-            pl.name AS place,
-            pl.name AS lugar,
-            ur.role_id
-        FROM users u
-        LEFT JOIN user_roles ur ON u.id = ur.user_id
-        LEFT JOIN user_departments ud ON u.id = ud.user_id
-          LEFT JOIN phone_numbers p ON ud.id = p.user_department_id
-        LEFT JOIN departments d ON ud.department_id = d.id
-        LEFT JOIN places pl ON d.place_id = pl.id
-        LEFT JOIN user_assigned_lines ual ON u.id = ual.user_id AND ual.return_date IS NULL
-        LEFT JOIN company_lines cl ON ual.line_id = cl.id`;
+        if (!user.password) {
+            return res.status(401).json({ error: 'Usuario no tiene contraseña configurada' });
+        }
 
-    if (query) {
-        const likeQuery = '%' + query + '%';
-        db.query(
-            selectQuery + ' WHERE u.name LIKE ? OR u.last_name LIKE ? OR CONCAT(u.name, " ", u.last_name) LIKE ?',
-            [likeQuery, likeQuery, likeQuery],
-            (err, results) => {
-                if (err) return res.status(500).send(err);
-                res.json(results);
-            }
+        const validPassword = bcrypt.compareSync(password, user.password);
+        if (!validPassword) {
+            return res.status(401).json({ error: 'Credenciales inválidas' });
+        }
+
+        const token = jwt.sign(
+            { id: user.id, username: user.username, role_id: user.role_id },
+            config.jwtSecret,
+            { expiresIn: config.jwtExpiresIn }
         );
-    } else {
-        db.query(selectQuery, (err, results) => {
-            if (err) return res.status(500).send(err);
-            res.json(results);
+
+        res.json({
+            success: true,
+            token,
+            user: {
+                id: user.id,
+                name: user.name,
+                username: user.username,
+                role_id: user.role_id,
+                role_name: user.role_name,
+                role_slug: user.role_slug
+            }
         });
+    } catch (err) {
+        console.error('Error en login:', err);
+        res.status(500).json({ error: 'Error interno en la autenticación' });
     }
 });
 
-//? endpoint buscar por nombre y apellido
-app.get('/contacts/staff/search/:query', authenticateToken, (req, res) => {
-    const query = req.params.query;
-    const selectQuery = `
-        SELECT 
-            u.id, 
-            u.name, 
-            u.name AS usuario_nombre,
-            u.last_name, 
-            u.last_name AS usuario_apellido,
-            u.document_type,
-            u.document_number,
-            CONCAT(u.document_type, u.document_number) AS ci, 
-            u.email,
-            u.username,
-            u.date_in,
-            p.local_phone,
-            p.local_phone AS telefono_local,
-            cl.id AS line_id,
-            cl.phone_number AS cell_phone,
-            cl.phone_number AS telefono_personal,
-            p.ext,
-            p.ext AS extension,
-            d.name AS department,
-            d.name AS departamento,
-            ud.position,
-            ud.position AS cargo,
-            ud.position AS posicion,
-            pl.name AS place,
-            pl.name AS lugar,
-            ur.role_id
-        FROM users u
-        LEFT JOIN user_roles ur ON u.id = ur.user_id
-        LEFT JOIN user_departments ud ON u.id = ud.user_id
-          LEFT JOIN phone_numbers p ON ud.id = p.user_department_id
-        LEFT JOIN departments d ON ud.department_id = d.id
-        LEFT JOIN places pl ON d.place_id = pl.id
-        LEFT JOIN user_assigned_lines ual ON u.id = ual.user_id AND ual.return_date IS NULL
-        LEFT JOIN company_lines cl ON ual.line_id = cl.id`;
+//? -------------------------------------------------------------
+//? CONTACTOS / PERSONAL (STAFF)
+//? -------------------------------------------------------------
 
-    if (query) {
-        const likeQuery = '%' + query + '%';
-        db.query(
-            selectQuery + ' WHERE u.name LIKE ? OR u.last_name LIKE ? OR CONCAT(u.name, " ", u.last_name) LIKE ?',
-            [likeQuery, likeQuery, likeQuery],
-            (err, results) => {
-                if (err) return res.status(500).send(err);
-                res.json(results);
-            }
-        );
-    } else {
-        db.query(selectQuery, (err, results) => {
-            if (err) return res.status(500).send(err);
-            res.json(results);
-        });
+// Base SELECT para personal
+const getStaffBaseQuery = (includeDeleted = false) => `
+    SELECT 
+        u.id, 
+        u.name, 
+        u.name AS usuario_nombre,
+        u.last_name, 
+        u.last_name AS usuario_apellido,
+        u.document_type,
+        u.document_number,
+        CONCAT(u.document_type, u.document_number) AS ci, 
+        u.email,
+        u.username,
+        u.date_in,
+        u.deleted_at,
+        p.local_phone,
+        p.local_phone AS telefono_local,
+        cl.id AS line_id,
+        cl.phone_number AS cell_phone,
+        cl.phone_number AS telefono_personal,
+        p.ext,
+        p.ext AS extension,
+        d.name AS department,
+        d.name AS departamento,
+        ud.position,
+        ud.position AS cargo,
+        ud.position AS posicion,
+        pl.name AS place,
+        pl.name AS lugar,
+        ur.role_id
+    FROM users u
+    LEFT JOIN user_roles ur ON u.id = ur.user_id AND ur.deleted_at IS NULL
+    LEFT JOIN user_departments ud ON u.id = ud.user_id AND ud.deleted_at IS NULL
+    LEFT JOIN phone_numbers p ON ud.id = p.user_department_id AND p.deleted_at IS NULL
+    LEFT JOIN departments d ON ud.department_id = d.id AND d.deleted_at IS NULL
+    LEFT JOIN places pl ON d.place_id = pl.id AND pl.deleted_at IS NULL
+    LEFT JOIN user_assigned_lines ual ON u.id = ual.user_id AND ual.return_date IS NULL AND ual.deleted_at IS NULL
+    LEFT JOIN company_lines cl ON ual.line_id = cl.id AND cl.deleted_at IS NULL
+    ${includeDeleted ? '' : 'WHERE u.deleted_at IS NULL'}
+`;
+
+// Obtener datos del personal
+app.get('/contacts/staff', authenticate, requirePermission('agenda.view'), async (req, res) => {
+    try {
+        const query = req.query.query;
+        const canSeeDeleted = req.access.permissions.has('employees.restore') && req.query.include_deleted === 'true';
+        let selectQuery = getStaffBaseQuery(canSeeDeleted);
+
+        if (query && query.trim()) {
+            const likeQuery = '%' + query.trim() + '%';
+            const connector = canSeeDeleted ? 'WHERE' : 'AND';
+            selectQuery += ` ${connector} (u.name LIKE ? OR u.last_name LIKE ? OR CONCAT(u.name, " ", u.last_name) LIKE ?)`;
+            const [results] = await pool.query(selectQuery, [likeQuery, likeQuery, likeQuery]);
+            return res.json(results);
+        }
+
+        const [results] = await pool.query(selectQuery);
+        res.json(results);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Error al obtener personal', details: err });
     }
 });
 
-//? endpoint para crear un usuario (soporta /contacts/create y /contacts/staff)
-app.post(['/contacts/create', '/contacts/staff'], authenticateToken, (req, res) => {
-    const {name, last_name, document_type, document_number, email, username, password, date_in, status } = req.body;
-    const hashedPassword = password ? bcrypt.hashSync(password, 10) : null;
-    db.query('INSERT INTO users (name, last_name, document_type, document_number, email, username, password, date_in, status) VALUES (?,?,?,?,?,?,?,?,?)', [name, last_name, document_type, document_number, email, username, hashedPassword, date_in, status], (err, results) => {
-        if (err) return res.status(500).send(err);
+// Buscar personal por término
+app.get('/contacts/staff/search/:query', authenticate, requirePermission('agenda.view'), async (req, res) => {
+    try {
+        const query = req.params.query;
+        const canSeeDeleted = req.access.permissions.has('employees.restore') && req.query.include_deleted === 'true';
+        let selectQuery = getStaffBaseQuery(canSeeDeleted);
+
+        if (query && query.trim()) {
+            const likeQuery = '%' + query.trim() + '%';
+            const connector = canSeeDeleted ? 'WHERE' : 'AND';
+            selectQuery += ` ${connector} (u.name LIKE ? OR u.last_name LIKE ? OR CONCAT(u.name, " ", u.last_name) LIKE ?)`;
+            const [results] = await pool.query(selectQuery, [likeQuery, likeQuery, likeQuery]);
+            return res.json(results);
+        }
+
+        const [results] = await pool.query(selectQuery);
         res.json(results);
-    });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Error al buscar personal', details: err });
+    }
 });
 
-//? endpoint para actualizar un usuario (soporta /contacts/update/:id y /contacts/staff/:id)
-app.put(['/contacts/update/:id', '/contacts/staff/:id'], authenticateToken, (req, res) => {
-    const id = req.params.id;
-    const {name, last_name, document_type, document_number, email, username, password, date_in, status } = req.body;
-    db.query('UPDATE users SET name = ?, last_name = ?, document_type = ?, document_number = ?, email = ?, username = ?, password = ?, date_in = ?, status = ? WHERE id = ?', [name,last_name,document_type,document_number,email,username,password,date_in,status, id], (err, results) => {
-        if (err) return res.status(500).send(err);
-        res.json(results);
-    });
+//? Crear contacto completo (users, phone_numbers, user_departments, user_roles)
+app.post('/contacts/create-full', authenticate, requirePermission('employees.create'), async (req, res) => {
+    const {
+        name,
+        last_name,
+        ci,
+        document_type,
+        document_number,
+        date_in,
+        local_phone,
+        cell_phone,
+        department_id,
+        position,
+        email,
+        username,
+        password,
+        role_id
+    } = req.body;
+
+    let doc_type = document_type || 'V';
+    let doc_number = document_number || ci;
+    
+    if (ci && !document_number) {
+        if (ci.toUpperCase().startsWith('V') || ci.toUpperCase().startsWith('E')) {
+            doc_type = ci.toUpperCase().charAt(0);
+            doc_number = ci.substring(1).replace(/[^0-9]/g, '');
+        }
+    }
+
+    // Resolver rol a asignar según permisos
+    let targetRoleId;
+    if (req.access.permissions.has('employees.assign-role') && role_id) {
+        const resolved = await resolveAssignableRole(req.access, role_id);
+        if (resolved.error) {
+            return res.status(resolved.status).json({ error: resolved.error });
+        }
+        targetRoleId = resolved.roleId;
+    } else {
+        // Rol 3 (Operador) o sin permiso: asignar rol por defecto (Consulta = 4)
+        targetRoleId = await getDefaultRoleId() || 4;
+    }
+
+    const hashedPassword = password && password.trim() ? bcrypt.hashSync(password, 10) : null;
+    const conn = await pool.getConnection();
+
+    try {
+        await conn.beginTransaction();
+
+        // 1. Insert into users
+        const userQuery = 'INSERT INTO users (name, last_name, document_type, document_number, email, username, password, date_in) VALUES (?, ?, ?, ?, ?, ?, ?, ?)';
+        const [userResult] = await conn.query(userQuery, [
+            name.trim(),
+            last_name.trim(),
+            doc_type,
+            doc_number ? doc_number.trim() : null,
+            email ? email.trim() : null,
+            username ? username.trim() : null,
+            hashedPassword,
+            date_in || null
+        ]);
+
+        const userId = userResult.insertId;
+
+        // 2. Insert into user_departments
+        const deptQuery = 'INSERT INTO user_departments (user_id, department_id, position) VALUES (?, ?, ?)';
+        const [deptRes] = await conn.query(deptQuery, [userId, department_id ? Number(department_id) : null, position ? position.trim() : '']);
+        const userDeptId = deptRes.insertId;
+
+        // 3. Insert into phone_numbers
+        const phoneQuery = 'INSERT INTO phone_numbers (user_department_id, local_phone) VALUES (?, ?)';
+        await conn.query(phoneQuery, [userDeptId, local_phone ? local_phone.trim() : null]);
+
+        // 4. Insert into user_roles
+        const roleQuery = 'INSERT INTO user_roles (user_id, role_id) VALUES (?, ?)';
+        await conn.query(roleQuery, [userId, targetRoleId]);
+
+        // 5. Asignar línea corporativa si se especificó
+        if (cell_phone) {
+            const lineId = Number(cell_phone);
+            const assignQuery = 'INSERT INTO user_assigned_lines (user_id, line_id, assigned_date) VALUES (?, ?, CURDATE())';
+            await conn.query(assignQuery, [userId, lineId]);
+
+            const updateLineQuery = "UPDATE company_lines SET status = 'asignado' WHERE id = ?";
+            await conn.query(updateLineQuery, [lineId]);
+        }
+
+        await conn.commit();
+        res.status(201).json({ success: true, userId });
+    } catch (err) {
+        await conn.rollback();
+        console.error("Error al crear contacto completo:", err);
+        if (err.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({ error: 'Ya existe un usuario con ese documento, email o nombre de usuario', details: err });
+        }
+        res.status(500).json({ error: 'Error al registrar contacto', details: err });
+    } finally {
+        conn.release();
+    }
 });
 
-//? endpoint para eliminar un usuario (soporta /contacts/delete/:id, /contacts/staff/:id y /contacts/:id)
-app.delete(['/contacts/delete/:id', '/contacts/staff/:id', '/contacts/:id'], authenticateToken, (req, res) => {
-    const { id } = req.params;
-    db.query('DELETE FROM users WHERE id = ?', [id], (err, results) => {
-        if (err) return res.status(500).send(err);
-        res.json(results);
-    });
+//? Actualizar contacto completo
+app.put('/contacts/update-full/:id', authenticate, requirePermission('employees.update'), async (req, res) => {
+    const id = parseId(req.params.id);
+    if (!id) return res.status(400).json({ error: 'ID de usuario inválido' });
+
+    const targetUser = await getTargetUser(id);
+    if (!targetUser) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+    // Si ya está eliminado por soft-delete, solo admin con employees.restore puede tocarlo
+    if (targetUser.deleted_at && !req.access.permissions.has('employees.restore')) {
+        return res.status(403).json({ error: 'No puede modificar un usuario eliminado' });
+    }
+
+    // Regla de jerarquía: no puede editar usuarios con rol superior al propio
+    if (!canManageTarget(req.access, targetUser)) {
+        return res.status(403).json({ error: 'No tiene permisos para modificar a un usuario de nivel superior' });
+    }
+
+    const {
+        name,
+        last_name,
+        ci,
+        document_type,
+        document_number,
+        date_in,
+        local_phone,
+        cell_phone,
+        department_id,
+        position,
+        email,
+        username,
+        password,
+        role_id
+    } = req.body;
+
+    let doc_type = document_type || 'V';
+    let doc_number = document_number || ci;
+    
+    if (ci && !document_number) {
+        if (ci.toUpperCase().startsWith('V') || ci.toUpperCase().startsWith('E')) {
+            doc_type = ci.toUpperCase().charAt(0);
+            doc_number = ci.substring(1).replace(/[^0-9]/g, '');
+        }
+    }
+
+    const conn = await pool.getConnection();
+
+    try {
+        await conn.beginTransaction();
+
+        // 1. Update users
+        let userQuery = 'UPDATE users SET name = ?, last_name = ?, document_type = ?, document_number = ?, date_in = ?';
+        let queryParams = [name.trim(), last_name.trim(), doc_type, doc_number ? doc_number.trim() : null, date_in || null];
+
+        if (email !== undefined) {
+            userQuery += ', email = ?';
+            queryParams.push(email ? email.trim() : null);
+        }
+        if (username !== undefined) {
+            userQuery += ', username = ?';
+            queryParams.push(username ? username.trim() : null);
+        }
+        if (password && password.trim()) {
+            userQuery += ', password = ?';
+            queryParams.push(bcrypt.hashSync(password, 10));
+        }
+
+        userQuery += ' WHERE id = ?';
+        queryParams.push(id);
+
+        await conn.query(userQuery, queryParams);
+
+        // 2. Limpiar departamentos asignados previos
+        await conn.query('DELETE FROM user_departments WHERE user_id = ?', [id]);
+
+        // 3. Insertar nuevo departamento
+        const insertDeptQuery = 'INSERT INTO user_departments (user_id, department_id, position) VALUES (?, ?, ?)';
+        const [deptRes] = await conn.query(insertDeptQuery, [id, department_id ? Number(department_id) : null, position ? position.trim() : '']);
+        const userDeptId = deptRes.insertId;
+
+        // 4. Insertar nuevo teléfono local
+        const phoneQuery = 'INSERT INTO phone_numbers (user_department_id, local_phone) VALUES (?, ?)';
+        await conn.query(phoneQuery, [userDeptId, local_phone ? local_phone.trim() : null]);
+
+        // 5. Actualizar rol solo si tiene permiso `employees.assign-role`
+        if (req.access.permissions.has('employees.assign-role') && role_id) {
+            const resolved = await resolveAssignableRole(req.access, role_id);
+            if (resolved.error) {
+                await conn.rollback();
+                return res.status(resolved.status).json({ error: resolved.error });
+            }
+            await conn.query('DELETE FROM user_roles WHERE user_id = ?', [id]);
+            await conn.query('INSERT INTO user_roles (user_id, role_id) VALUES (?, ?)', [id, resolved.roleId]);
+            invalidate(id);
+        }
+
+        // 6. Gestionar asignación de línea corporativa
+        const [currentLineRes] = await conn.query(
+            'SELECT id, line_id FROM user_assigned_lines WHERE user_id = ? AND return_date IS NULL',
+            [id]
+        );
+        const currentAssigned = currentLineRes[0];
+        const newLineId = cell_phone ? Number(cell_phone) : null;
+
+        if (currentAssigned && currentAssigned.line_id !== newLineId) {
+            await conn.query('UPDATE user_assigned_lines SET return_date = CURDATE() WHERE id = ?', [currentAssigned.id]);
+            await conn.query("UPDATE company_lines SET status = 'disponible' WHERE id = ?", [currentAssigned.line_id]);
+        }
+
+        if (newLineId && (!currentAssigned || currentAssigned.line_id !== newLineId)) {
+            await conn.query('INSERT INTO user_assigned_lines (user_id, line_id, assigned_date) VALUES (?, ?, CURDATE())', [id, newLineId]);
+            await conn.query("UPDATE company_lines SET status = 'asignado' WHERE id = ?", [newLineId]);
+        }
+
+        await conn.commit();
+        res.json({ success: true, message: 'Contacto actualizado exitosamente' });
+    } catch (err) {
+        await conn.rollback();
+        console.error("Error al actualizar contacto:", err);
+        if (err.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({ error: 'Ya existe un usuario con ese documento, email o nombre de usuario', details: err });
+        }
+        res.status(500).json({ error: 'Error al actualizar contacto', details: err });
+    } finally {
+        conn.release();
+    }
 });
 
-//? endpoint para obtener los departamentos 
-app.get('/departments', (req, res) => {
-    db.query('SELECT * FROM departments', (err, results) => {
-        if (err) return res.status(500).send(err);
-        res.json(results);
-    });
+//? Soft-Delete de usuario (Personal)
+app.delete(['/contacts/delete/:id', '/contacts/staff/:id', '/contacts/:id'], authenticate, requirePermission('employees.delete'), async (req, res) => {
+    const id = parseId(req.params.id);
+    if (!id) return res.status(400).json({ error: 'ID de usuario inválido' });
+
+    const targetUser = await getTargetUser(id);
+    if (!targetUser) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+    if (targetUser.deleted_at) {
+        return res.status(400).json({ error: 'El usuario ya ha sido eliminado previamente' });
+    }
+
+    if (!canManageTarget(req.access, targetUser)) {
+        return res.status(403).json({ error: 'No tiene permisos para eliminar a un usuario de nivel superior o igual al suyo' });
+    }
+
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
+
+        // 1. Soft delete en users
+        await conn.query('UPDATE users SET deleted_at = NOW(), status = 0 WHERE id = ?', [id]);
+
+        // 2. Liberar líneas asignadas activas
+        const [lines] = await conn.query('SELECT line_id FROM user_assigned_lines WHERE user_id = ? AND return_date IS NULL', [id]);
+        if (lines.length > 0) {
+            await conn.query('UPDATE user_assigned_lines SET return_date = CURDATE() WHERE user_id = ? AND return_date IS NULL', [id]);
+            const lineIds = lines.map(l => l.line_id);
+            await conn.query("UPDATE company_lines SET status = 'disponible' WHERE id IN (?)", [lineIds]);
+        }
+
+        await conn.commit();
+        invalidate(id);
+        res.json({ success: true, message: 'Usuario eliminado correctamente (soft-delete)' });
+    } catch (err) {
+        await conn.rollback();
+        console.error('Error al eliminar usuario:', err);
+        res.status(500).json({ error: 'Error al eliminar usuario', details: err });
+    } finally {
+        conn.release();
+    }
 });
 
-//? endpoint para obtener la lista de departamentos activos (status = 1) con nombre de lugar (roles 1, 2, 3) (soporta paginación)
-app.get('/contacts/departments', authenticateToken, requireRole([1, 2, 3]), (req, res) => {
+//? Restaurar usuario (soft delete reverse - solo con permiso employees.restore, ej. Admin)
+app.post('/contacts/restore/:id', authenticate, requirePermission('employees.restore'), async (req, res) => {
+    const id = parseId(req.params.id);
+    if (!id) return res.status(400).json({ error: 'ID de usuario inválido' });
+
+    try {
+        const [result] = await pool.query(
+            'UPDATE users SET deleted_at = NULL, status = 1 WHERE id = ? AND deleted_at IS NOT NULL',
+            [id]
+        );
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ error: 'Usuario no encontrado o no está eliminado' });
+        }
+        invalidate(id);
+        res.json({ success: true, message: 'Usuario restaurado exitosamente' });
+    } catch (err) {
+        if (err.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({ error: 'No se puede restaurar: el documento, email o username ya está en uso por otro usuario activo' });
+        }
+        res.status(500).json({ error: 'Error al restaurar usuario', details: err });
+    }
+});
+
+//? -------------------------------------------------------------
+//? DEPARTAMENTOS
+//? -------------------------------------------------------------
+
+// Público (usado en Home)
+app.get('/departments', async (req, res) => {
+    try {
+        const [results] = await pool.query('SELECT * FROM departments WHERE deleted_at IS NULL AND status = 1');
+        res.json(results);
+    } catch (err) {
+        res.status(500).json({ error: 'Error al obtener departamentos' });
+    }
+});
+
+// Protegido con permisos y paginación
+app.get('/contacts/departments', authenticate, requirePermission('departments.view', 'employees.create', 'employees.update'), async (req, res) => {
     const { page, limit, search, place_id } = req.query;
 
-    let whereClause = 'WHERE d.status = 1';
+    let whereClause = 'WHERE d.status = 1 AND d.deleted_at IS NULL';
     const params = [];
 
     if (place_id && place_id !== 'todos') {
@@ -214,38 +527,31 @@ app.get('/contacts/departments', authenticateToken, requireRole([1, 2, 3]), (req
         params.push(like, like);
     }
 
-    // Si no se pide paginación, devolver el listado completo (compatibilidad)
-    if (!page) {
-        const query = `
-            SELECT d.id, d.name, d.place_id, pl.name AS place_name, d.status, d.created_at, d.updated_at 
+    try {
+        if (!page) {
+            const query = `
+                SELECT d.id, d.name, d.place_id, pl.name AS place_name, d.status, d.created_at, d.updated_at 
+                FROM departments d 
+                INNER JOIN places pl ON d.place_id = pl.id 
+                ${whereClause} 
+                ORDER BY d.name ASC
+            `;
+            const [results] = await pool.query(query, params);
+            return res.json(results);
+        }
+
+        const pageNum = Math.max(1, parseInt(page, 10) || 1);
+        const limitNum = Math.max(1, Math.min(100, parseInt(limit, 10) || 10));
+        const offset = (pageNum - 1) * limitNum;
+
+        const countQuery = `
+            SELECT COUNT(*) AS total 
             FROM departments d 
             INNER JOIN places pl ON d.place_id = pl.id 
-            ${whereClause} 
-            ORDER BY d.name ASC
+            ${whereClause}
         `;
-        db.query(query, params, (err, results) => {
-            if (err) return res.status(500).json({ error: 'Error al consultar departamentos', details: err });
-            res.json(results);
-        });
-        return;
-    }
-
-    // Modo paginado
-    const pageNum = Math.max(1, parseInt(page, 10) || 1);
-    const limitNum = Math.max(1, Math.min(100, parseInt(limit, 10) || 10));
-    const offset = (pageNum - 1) * limitNum;
-
-    const countQuery = `
-        SELECT COUNT(*) AS total 
-        FROM departments d 
-        INNER JOIN places pl ON d.place_id = pl.id 
-        ${whereClause}
-    `;
-
-    db.query(countQuery, params, (countErr, countResults) => {
-        if (countErr) return res.status(500).json({ error: 'Error al contar departamentos', details: countErr });
-
-        const total = countResults[0].total;
+        const [[countResult]] = await pool.query(countQuery, params);
+        const total = countResult.total;
         const totalPages = Math.ceil(total / limitNum);
 
         const dataQuery = `
@@ -256,47 +562,45 @@ app.get('/contacts/departments', authenticateToken, requireRole([1, 2, 3]), (req
             ORDER BY d.name ASC 
             LIMIT ? OFFSET ?
         `;
-
-        db.query(dataQuery, [...params, limitNum, offset], (dataErr, rows) => {
-            if (dataErr) return res.status(500).json({ error: 'Error al obtener departamentos', details: dataErr });
-            res.json({
-                data: rows,
-                total,
-                page: pageNum,
-                limit: limitNum,
-                totalPages
-            });
+        const [rows] = await pool.query(dataQuery, [...params, limitNum, offset]);
+        res.json({
+            data: rows,
+            total,
+            page: pageNum,
+            limit: limitNum,
+            totalPages
         });
-    });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Error al consultar departamentos', details: err });
+    }
 });
 
-//? endpoint para crear un departamento (roles 1, 2, 3)
-app.post('/contacts/departments', authenticateToken, requireRole([1, 2, 3]), (req, res) => {
+// Crear departamento
+app.post('/contacts/departments', authenticate, requirePermission('departments.create'), async (req, res) => {
     const { name, place_id, status } = req.body;
     if (!name || !place_id) {
         return res.status(400).json({ error: 'El nombre y el lugar son requeridos' });
     }
 
     const deptStatus = status !== undefined ? Number(status) : 1;
-
-    db.query(
-        'INSERT INTO departments (name, place_id, status) VALUES (?, ?, ?)',
-        [name.trim(), Number(place_id), deptStatus],
-        (err, results) => {
-            if (err) {
-                if (err.code === 'ER_DUP_ENTRY') {
-                    return res.status(409).json({ error: 'Ya existe un departamento con ese nombre en esta sede/lugar' });
-                }
-                return res.status(500).json({ error: 'Error al crear departamento', details: err });
-            }
-            res.status(201).json({ success: true, insertId: results.insertId, message: 'Departamento creado con éxito' });
+    try {
+        const [results] = await pool.query(
+            'INSERT INTO departments (name, place_id, status) VALUES (?, ?, ?)',
+            [name.trim(), Number(place_id), deptStatus]
+        );
+        res.status(201).json({ success: true, insertId: results.insertId, message: 'Departamento creado con éxito' });
+    } catch (err) {
+        if (err.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({ error: 'Ya existe un departamento con ese nombre en esta sede/lugar' });
         }
-    );
+        res.status(500).json({ error: 'Error al crear departamento', details: err });
+    }
 });
 
-//? endpoint para actualizar/modificar un departamento (roles 1, 2, 3)
-app.put('/contacts/departments/:id', authenticateToken, requireRole([1, 2, 3]), (req, res) => {
-    const id = Number(req.params.id);
+// Modificar departamento
+app.put('/contacts/departments/:id', authenticate, requirePermission('departments.update'), async (req, res) => {
+    const id = parseId(req.params.id);
     const { name, place_id, status } = req.body;
 
     if (!id || !name || !place_id) {
@@ -304,50 +608,54 @@ app.put('/contacts/departments/:id', authenticateToken, requireRole([1, 2, 3]), 
     }
 
     const deptStatus = status !== undefined ? Number(status) : 1;
-
-    db.query(
-        'UPDATE departments SET name = ?, place_id = ?, status = ? WHERE id = ?',
-        [name.trim(), Number(place_id), deptStatus, id],
-        (err, results) => {
-            if (err) {
-                if (err.code === 'ER_DUP_ENTRY') {
-                    return res.status(409).json({ error: 'Ya existe un departamento con ese nombre en esta sede/lugar' });
-                }
-                return res.status(500).json({ error: 'Error al actualizar departamento', details: err });
-            }
-            if (results.affectedRows === 0) {
-                return res.status(404).json({ error: 'Departamento no encontrado' });
-            }
-            res.json({ success: true, message: 'Departamento actualizado con éxito' });
+    try {
+        const [results] = await pool.query(
+            'UPDATE departments SET name = ?, place_id = ?, status = ? WHERE id = ?',
+            [name.trim(), Number(place_id), deptStatus, id]
+        );
+        if (results.affectedRows === 0) {
+            return res.status(404).json({ error: 'Departamento no encontrado' });
         }
-    );
+        res.json({ success: true, message: 'Departamento actualizado con éxito' });
+    } catch (err) {
+        if (err.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({ error: 'Ya existe un departamento con ese nombre en esta sede/lugar' });
+        }
+        res.status(500).json({ error: 'Error al actualizar departamento', details: err });
+    }
 });
 
-//? endpoint para obtener el lugar (incluye id y name)
-app.get('/places', (req, res) => {
-    db.query('SELECT id, name FROM places;', (err,results) => {
-        if (err) return res.status(500).send(err);
+//? -------------------------------------------------------------
+//? LUGARES / SEDES (PLACES)
+//? -------------------------------------------------------------
+
+// Público (usado en Home y filtros)
+app.get('/places', async (req, res) => {
+    try {
+        const [results] = await pool.query('SELECT id, name FROM places WHERE status = 1 AND deleted_at IS NULL');
         res.json(results);
-    });
+    } catch (err) {
+        res.status(500).json({ error: 'Error al consultar lugares' });
+    }
 });
 
-//? endpoint para buscar por lugar (soporta paginación y búsqueda)
-app.get('/contacts/places/:name', authenticateToken, (req, res) => {
+// Buscar personal por sede/lugar
+app.get('/contacts/places/:name', authenticate, requirePermission('agenda.by-place', 'agenda.view'), async (req, res) => {
     const { name } = req.params;
     const { page, limit, search } = req.query;
 
     const baseFrom = `
         FROM users u
-        LEFT JOIN user_roles ur ON u.id = ur.user_id
-        INNER JOIN user_departments ud ON u.id = ud.user_id
-        INNER JOIN phone_numbers p ON ud.id = p.user_department_id 
-        INNER JOIN departments d ON ud.department_id = d.id 
-        INNER JOIN places pl ON d.place_id = pl.id  
-        LEFT JOIN user_assigned_lines ual ON u.id = ual.user_id AND ual.return_date IS NULL
-        LEFT JOIN company_lines cl ON ual.line_id = cl.id
+        LEFT JOIN user_roles ur ON u.id = ur.user_id AND ur.deleted_at IS NULL
+        INNER JOIN user_departments ud ON u.id = ud.user_id AND ud.deleted_at IS NULL
+        INNER JOIN phone_numbers p ON ud.id = p.user_department_id AND p.deleted_at IS NULL
+        INNER JOIN departments d ON ud.department_id = d.id AND d.deleted_at IS NULL
+        INNER JOIN places pl ON d.place_id = pl.id AND pl.deleted_at IS NULL
+        LEFT JOIN user_assigned_lines ual ON u.id = ual.user_id AND ual.return_date IS NULL AND ual.deleted_at IS NULL
+        LEFT JOIN company_lines cl ON ual.line_id = cl.id AND cl.deleted_at IS NULL
     `;
 
-    let whereClause = 'WHERE pl.name = ?';
+    let whereClause = 'WHERE pl.name = ? AND u.deleted_at IS NULL';
     const params = [name];
 
     if (search && search.trim()) {
@@ -356,65 +664,51 @@ app.get('/contacts/places/:name', authenticateToken, (req, res) => {
         params.push(like, like, like, like, like, like, like);
     }
 
-    // Si no se pide paginación, devolver el listado completo (compatibilidad)
-    if (!page) {
-        const selectQuery = `
-            SELECT 
-                u.id, 
-                u.name, 
-                u.name AS usuario_nombre,
-                u.last_name, 
-                u.last_name AS usuario_apellido,
-                u.document_type,
-                u.document_number,
-                CONCAT(u.document_type, u.document_number) AS ci, 
-                u.email,
-                u.username,
-                u.date_in,
-                p.local_phone,
-                p.local_phone AS telefono_local,
-                cl.id AS line_id,
-                cl.phone_number AS cell_phone,
-                cl.phone_number AS telefono_personal,
-                p.ext,
-                p.ext AS extension,
-                d.name AS department,
-                d.name AS departamento,
-                ud.position,
-                ud.position AS cargo,
-                ud.position AS posicion,
-                pl.name AS place,
-                pl.name AS lugar,
-                ur.role_id
-            ${baseFrom}
-            ${whereClause}
-            ORDER BY u.name ASC
-        `;
-
-        db.query(selectQuery, params, (err, rows) => {
-            if (err) {
-                console.error(err);
-                return res.status(500).json({ error: "Error en la base de datos", details: err });
-            }
-            res.json(rows);
-        });
-        return;
-    }
-
-    // Modo paginado
-    const pageNum = Math.max(1, parseInt(page, 10) || 1);
-    const limitNum = Math.max(1, Math.min(100, parseInt(limit, 10) || 10));
-    const offset = (pageNum - 1) * limitNum;
-
-    const countQuery = `SELECT COUNT(*) AS total ${baseFrom} ${whereClause}`;
-
-    db.query(countQuery, params, (countErr, countResults) => {
-        if (countErr) {
-            console.error(countErr);
-            return res.status(500).json({ error: "Error al contar personal", details: countErr });
+    try {
+        if (!page) {
+            const selectQuery = `
+                SELECT 
+                    u.id, 
+                    u.name, 
+                    u.name AS usuario_nombre,
+                    u.last_name, 
+                    u.last_name AS usuario_apellido,
+                    u.document_type,
+                    u.document_number,
+                    CONCAT(u.document_type, u.document_number) AS ci, 
+                    u.email,
+                    u.username,
+                    u.date_in,
+                    p.local_phone,
+                    p.local_phone AS telefono_local,
+                    cl.id AS line_id,
+                    cl.phone_number AS cell_phone,
+                    cl.phone_number AS telefono_personal,
+                    p.ext,
+                    p.ext AS extension,
+                    d.name AS department,
+                    d.name AS departamento,
+                    ud.position,
+                    ud.position AS cargo,
+                    ud.position AS posicion,
+                    pl.name AS place,
+                    pl.name AS lugar,
+                    ur.role_id
+                ${baseFrom}
+                ${whereClause}
+                ORDER BY u.name ASC
+            `;
+            const [rows] = await pool.query(selectQuery, params);
+            return res.json(rows);
         }
 
-        const total = countResults[0].total;
+        const pageNum = Math.max(1, parseInt(page, 10) || 1);
+        const limitNum = Math.max(1, Math.min(100, parseInt(limit, 10) || 10));
+        const offset = (pageNum - 1) * limitNum;
+
+        const countQuery = `SELECT COUNT(*) AS total ${baseFrom} ${whereClause}`;
+        const [[countResult]] = await pool.query(countQuery, params);
+        const total = countResult.total;
         const totalPages = Math.ceil(total / limitNum);
 
         const dataQuery = `
@@ -450,347 +744,47 @@ app.get('/contacts/places/:name', authenticateToken, (req, res) => {
             ORDER BY u.name ASC
             LIMIT ? OFFSET ?
         `;
-
-        db.query(dataQuery, [...params, limitNum, offset], (dataErr, rows) => {
-            if (dataErr) {
-                console.error(dataErr);
-                return res.status(500).json({ error: "Error al obtener personal", details: dataErr });
-            }
-            res.json({
-                data: rows,
-                total,
-                page: pageNum,
-                limit: limitNum,
-                totalPages
-            });
+        const [rows] = await pool.query(dataQuery, [...params, limitNum, offset]);
+        res.json({
+            data: rows,
+            total,
+            page: pageNum,
+            limit: limitNum,
+            totalPages
         });
-    });
-});
-
-//? endpoint para crear un contacto completo (users, phone_numbers, user_departments)
-app.post('/contacts/create-full', authenticateToken, (req, res) => {
-    const {
-        name,
-        last_name,
-        ci,
-        document_type,
-        document_number,
-        date_in,
-        local_phone,
-        cell_phone,
-        ext,
-        department_id,
-        position,
-        email,
-        username,
-        password,
-        role_id
-    } = req.body;
-
-    let doc_type = document_type || 'V';
-    let doc_number = document_number || ci;
-    
-    if (ci && !document_number) {
-        if (ci.toUpperCase().startsWith('V') || ci.toUpperCase().startsWith('E')) {
-            doc_type = ci.toUpperCase().charAt(0);
-            doc_number = ci.substring(1).replace(/[^0-9]/g, '');
-        }
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Error al consultar personal por sede', details: err });
     }
-
-    const hashedPassword = password ? bcrypt.hashSync(password, 10) : null;
-
-    db.beginTransaction((err) => {
-        if (err) {
-            console.error("Failed to begin transaction:", err);
-            return res.status(500).json({ error: "Failed to begin transaction", details: err });
-        }
-
-        // 1. Insert into users
-        const userQuery = 'INSERT INTO users (name, last_name, document_type, document_number, email, username, password, date_in) VALUES (?, ?, ?, ?, ?, ?, ?, ?)';
-        db.query(userQuery, [name, last_name, doc_type, doc_number || null, email || null, username || null, hashedPassword, date_in || null], (err, userResult) => {
-            if (err) {
-                console.error("Failed to insert user:", err);
-                return db.rollback(() => {
-                    res.status(500).json({ error: "Failed to insert user", details: err });
-                });
-            }
-
-            const userId = userResult.insertId;
-
-            // 2. Insert into user_departments
-            const deptQuery = 'INSERT INTO user_departments (user_id, department_id, position) VALUES (?, ?, ?)';
-            db.query(deptQuery, [userId, department_id || null, position || ''], (err, deptRes) => {
-                if (err) {
-                    console.error("Failed to insert user department:", err);
-                    return db.rollback(() => {
-                        res.status(500).json({ error: "Failed to insert user department", details: err });
-                    });
-                }
-                
-                const userDeptId = deptRes.insertId;
-
-                // 3. Insert into phone_numbers
-                const phoneQuery = 'INSERT INTO phone_numbers (user_department_id, local_phone) VALUES (?, ?)';
-                db.query(phoneQuery, [userDeptId, local_phone || null], (err) => {
-                    if (err) {
-                        console.error("Failed to insert phone numbers:", err);
-                        return db.rollback(() => {
-                            res.status(500).json({ error: "Failed to insert phone numbers", details: err });
-                        });
-                    }
-
-                    // 4. Insert into user_roles
-                    const roleQuery = 'INSERT INTO user_roles (user_id, role_id) VALUES (?, ?)';
-                    db.query(roleQuery, [userId, role_id || 4], (err) => {
-                        if (err) {
-                            console.error("Failed to insert user roles:", err);
-                            return db.rollback(() => {
-                                res.status(500).json({ error: "Failed to insert user roles", details: err });
-                            });
-                        }
-
-                        const assignLine = () => {
-                            if (!cell_phone) return commitTx();
-                            
-                            const assignQuery = 'INSERT INTO user_assigned_lines (user_id, line_id, assigned_date) VALUES (?, ?, CURDATE())';
-                            db.query(assignQuery, [userId, cell_phone], (err) => {
-                                if (err) {
-                                    console.error("Failed to assign company line:", err);
-                                    return db.rollback(() => res.status(500).json({ error: "Failed to assign line", details: err }));
-                                }
-
-                                const updateLineQuery = "UPDATE company_lines SET status = 'asignado' WHERE id = ?";
-                                db.query(updateLineQuery, [cell_phone], (err) => {
-                                    if (err) {
-                                        console.error("Failed to update company line status:", err);
-                                        return db.rollback(() => res.status(500).json({ error: "Failed to update line status", details: err }));
-                                    }
-                                    commitTx();
-                                });
-                            });
-                        };
-
-                        const commitTx = () => {
-                            db.commit((err) => {
-                                if (err) {
-                                    console.error("Failed to commit transaction:", err);
-                                    return db.rollback(() => res.status(500).json({ error: "Failed to commit transaction", details: err }));
-                                }
-                                res.status(201).json({ success: true, userId });
-                            });
-                        };
-
-                        assignLine();
-                    });
-                });
-            });
-        });
-    });
 });
 
-//? endpoint para actualizar un contacto completo (users, phone_numbers, user_departments)
-app.put('/contacts/update-full/:id', authenticateToken, (req, res) => {
-    const id = req.params.id;
-    const {
-        name,
-        last_name,
-        ci,
-        document_type,
-        document_number,
-        date_in,
-        local_phone,
-        cell_phone,
-        ext,
-        department_id,
-        position,
-        email,
-        username,
-        password,
-        role_id
-    } = req.body;
+//? -------------------------------------------------------------
+//? LÍNEAS CORPORATIVAS
+//? -------------------------------------------------------------
 
-    let doc_type = document_type || 'V';
-    let doc_number = document_number || ci;
-    
-    if (ci && !document_number) {
-        if (ci.toUpperCase().startsWith('V') || ci.toUpperCase().startsWith('E')) {
-            doc_type = ci.toUpperCase().charAt(0);
-            doc_number = ci.substring(1).replace(/[^0-9]/g, '');
-        }
-    }
-
-    db.beginTransaction((err) => {
-        if (err) {
-            console.error("Failed to begin transaction:", err);
-            return res.status(500).json({ error: "Failed to begin transaction", details: err });
-        }
-
-        // 1. Update users table
-        let userQuery = 'UPDATE users SET name = ?, last_name = ?, document_type = ?, document_number = ?, date_in = ?';
-        let queryParams = [name, last_name, doc_type, doc_number || null, date_in || null];
-        
-        if (email !== undefined) {
-            userQuery += ', email = ?';
-            queryParams.push(email || null);
-        }
-        if (username !== undefined) {
-            userQuery += ', username = ?';
-            queryParams.push(username || null);
-        }
-        if (password) {
-            userQuery += ', password = ?';
-            queryParams.push(bcrypt.hashSync(password, 10));
-        }
-        
-        userQuery += ' WHERE id = ?';
-        queryParams.push(id);
-
-        db.query(userQuery, queryParams, (err) => {
-            if (err) {
-                console.error("Failed to update user:", err);
-                return db.rollback(() => {
-                    res.status(500).json({ error: "Failed to update user", details: err });
-                });
-            }
-
-            // 2. Clear old user departments (this cascades to phone_numbers)
-            const deleteDeptQuery = 'DELETE FROM user_departments WHERE user_id = ?';
-            db.query(deleteDeptQuery, [id], (err) => {
-                if (err) {
-                    console.error("Failed to clear user departments:", err);
-                    return db.rollback(() => {
-                        res.status(500).json({ error: "Failed to clear user departments", details: err });
-                    });
-                }
-
-                // 3. Insert new user department
-                const insertDeptQuery = 'INSERT INTO user_departments (user_id, department_id, position) VALUES (?, ?, ?)';
-                db.query(insertDeptQuery, [id, department_id || null, position || ''], (err, deptRes) => {
-                    if (err) {
-                        console.error("Failed to insert user department:", err);
-                        return db.rollback(() => {
-                            res.status(500).json({ error: "Failed to insert user department", details: err });
-                        });
-                    }
-
-                    const userDeptId = deptRes.insertId;
-
-                    // 4. Insert new phone number
-                    const phoneQuery = 'INSERT INTO phone_numbers (user_department_id, local_phone) VALUES (?, ?)';
-                    db.query(phoneQuery, [userDeptId, local_phone || null], (err) => {
-                        if (err) {
-                            console.error("Failed to insert phone numbers:", err);
-                            return db.rollback(() => {
-                                res.status(500).json({ error: "Failed to insert phone numbers", details: err });
-                            });
-                        }
-
-                        // 5. Update user roles (assuming one role per user for now, or updating the primary role)
-                        // Wait, update-full doesn't receive role_id in req.body currently. Let's extract it if provided.
-                        const role_id = req.body.role_id;
-                        const updateRole = (callback) => {
-                            if (role_id) {
-                                db.query('DELETE FROM user_roles WHERE user_id = ?', [id], (err) => {
-                                    if (err) return db.rollback(() => res.status(500).json({ error: "Failed to clear user roles", details: err }));
-                                    db.query('INSERT INTO user_roles (user_id, role_id) VALUES (?, ?)', [id, role_id], (err) => {
-                                        if (err) return db.rollback(() => res.status(500).json({ error: "Failed to insert user role", details: err }));
-                                        callback();
-                                    });
-                                });
-                            } else {
-                                callback();
-                            }
-                        };
-
-                        updateRole(() => {
-                            const updateLineAssignment = () => {
-                            // Check current active line
-                            db.query('SELECT id, line_id FROM user_assigned_lines WHERE user_id = ? AND return_date IS NULL', [id], (err, currentLineRes) => {
-                                if (err) {
-                                    return db.rollback(() => res.status(500).json({ error: "Failed to check current line", details: err }));
-                                }
-                                
-                                const currentAssigned = currentLineRes[0];
-                                const newLineId = cell_phone ? Number(cell_phone) : null;
-                                
-                                // Step A: If there's an existing line and it's different from the new one, return it
-                                const releaseOldLine = (callback) => {
-                                    if (currentAssigned && currentAssigned.line_id !== newLineId) {
-                                        db.query('UPDATE user_assigned_lines SET return_date = CURDATE() WHERE id = ?', [currentAssigned.id], (err) => {
-                                            if (err) return db.rollback(() => res.status(500).json({ error: "Failed to release old line assignment", details: err }));
-                                            
-                                            db.query("UPDATE company_lines SET status = 'disponible' WHERE id = ?", [currentAssigned.line_id], (err) => {
-                                                if (err) return db.rollback(() => res.status(500).json({ error: "Failed to update old line status", details: err }));
-                                                callback();
-                                            });
-                                        });
-                                    } else {
-                                        callback();
-                                    }
-                                };
-                                
-                                // Step B: If there's a new line and it's different from the current one, assign it
-                                const assignNewLine = (callback) => {
-                                    if (newLineId && (!currentAssigned || currentAssigned.line_id !== newLineId)) {
-                                        db.query('INSERT INTO user_assigned_lines (user_id, line_id, assigned_date) VALUES (?, ?, CURDATE())', [id, newLineId], (err) => {
-                                            if (err) return db.rollback(() => res.status(500).json({ error: "Failed to assign new line", details: err }));
-                                            
-                                            db.query("UPDATE company_lines SET status = 'asignado' WHERE id = ?", [newLineId], (err) => {
-                                                if (err) return db.rollback(() => res.status(500).json({ error: "Failed to update new line status", details: err }));
-                                                callback();
-                                            });
-                                        });
-                                    } else {
-                                        callback();
-                                    }
-                                };
-                                
-                                releaseOldLine(() => {
-                                    assignNewLine(() => {
-                                        commitTx();
-                                    });
-                                });
-                            });
-                        };
-
-                        const commitTx = () => {
-                            db.commit((err) => {
-                                if (err) {
-                                    console.error("Failed to commit transaction:", err);
-                                    return db.rollback(() => res.status(500).json({ error: "Failed to commit transaction", details: err }));
-                                }
-                                res.status(200).json({ success: true });
-                            });
-                        };
-                        
-                        updateLineAssignment();
-                    });
-                });
-            });
-        });
-    });
-});
-});
-
-//? endpoint ver las lista de las lineas de compañia disponibles
-app.get('/contacts/company-lines/available', authenticateToken, (req, res) => {
-    db.query("SELECT id, phone_number, operator FROM company_lines WHERE status = 'disponible' AND active_status = 'activa'", (err, results) => {
-        if (err) return res.status(500).send(err);
+// Ver líneas disponibles
+app.get('/contacts/company-lines/available', authenticate, requirePermission('phone-lines.view', 'employees.create', 'employees.update'), async (req, res) => {
+    try {
+        const [results] = await pool.query(
+            "SELECT id, phone_number, operator FROM company_lines WHERE status = 'disponible' AND active_status = 'activa' AND deleted_at IS NULL"
+        );
         res.json(results);
-    });
+    } catch (err) {
+        res.status(500).json({ error: 'Error al obtener líneas disponibles' });
+    }
 });
 
-//? endpoint para obtener todas las líneas de compañía con usuario asignado (soporta paginación)
-app.get('/company-lines', authenticateToken, (req, res) => {
+// Ver todas las líneas con paginación
+app.get('/company-lines', authenticate, requirePermission('phone-lines.view'), async (req, res) => {
     const { page, limit, operator, search } = req.query;
 
     const baseFrom = `
         FROM company_lines cl
-        LEFT JOIN user_assigned_lines ual ON cl.id = ual.line_id AND ual.return_date IS NULL
-        LEFT JOIN users u ON ual.user_id = u.id
+        LEFT JOIN user_assigned_lines ual ON cl.id = ual.line_id AND ual.return_date IS NULL AND ual.deleted_at IS NULL
+        LEFT JOIN users u ON ual.user_id = u.id AND u.deleted_at IS NULL
     `;
 
-    const whereClauses = [];
+    const whereClauses = ['cl.deleted_at IS NULL'];
     const params = [];
 
     if (operator && operator.toLowerCase() !== 'todos') {
@@ -804,47 +798,40 @@ app.get('/company-lines', authenticateToken, (req, res) => {
         params.push(like, like, like, like, like, like, like, like);
     }
 
-    const whereSQL = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+    const whereSQL = `WHERE ${whereClauses.join(' AND ')}`;
 
-    // Si no se pide paginación, devolver el listado completo (compatibilidad)
-    if (!page) {
-        const query = `
-            SELECT 
-                cl.id,
-                cl.serial,
-                cl.phone_number,
-                cl.status,
-                cl.active_status,
-                cl.operator,
-                cl.created_at,
-                cl.updated_at,
-                ual.user_id,
-                u.name AS user_name,
-                u.last_name AS user_last_name,
-                CONCAT(u.name, ' ', u.last_name) AS assigned_user,
-                ual.assigned_date
-            ${baseFrom}
-            ${whereSQL}
-            ORDER BY cl.id DESC
-        `;
-        db.query(query, params, (err, results) => {
-            if (err) return res.status(500).json({ error: 'Error al consultar líneas', details: err });
-            res.json(results);
-        });
-        return;
-    }
+    try {
+        if (!page) {
+            const query = `
+                SELECT 
+                    cl.id,
+                    cl.serial,
+                    cl.phone_number,
+                    cl.status,
+                    cl.active_status,
+                    cl.operator,
+                    cl.created_at,
+                    cl.updated_at,
+                    ual.user_id,
+                    u.name AS user_name,
+                    u.last_name AS user_last_name,
+                    CONCAT(u.name, ' ', u.last_name) AS assigned_user,
+                    ual.assigned_date
+                ${baseFrom}
+                ${whereSQL}
+                ORDER BY cl.id DESC
+            `;
+            const [results] = await pool.query(query, params);
+            return res.json(results);
+        }
 
-    // Modo paginado
-    const pageNum = Math.max(1, parseInt(page, 10) || 1);
-    const limitNum = Math.max(1, Math.min(100, parseInt(limit, 10) || 10));
-    const offset = (pageNum - 1) * limitNum;
+        const pageNum = Math.max(1, parseInt(page, 10) || 1);
+        const limitNum = Math.max(1, Math.min(100, parseInt(limit, 10) || 10));
+        const offset = (pageNum - 1) * limitNum;
 
-    const countQuery = `SELECT COUNT(*) AS total ${baseFrom} ${whereSQL}`;
-
-    db.query(countQuery, params, (countErr, countResults) => {
-        if (countErr) return res.status(500).json({ error: 'Error al contar líneas', details: countErr });
-
-        const total = countResults[0].total;
+        const countQuery = `SELECT COUNT(*) AS total ${baseFrom} ${whereSQL}`;
+        const [[countResult]] = await pool.query(countQuery, params);
+        const total = countResult.total;
         const totalPages = Math.ceil(total / limitNum);
 
         const dataQuery = `
@@ -867,106 +854,64 @@ app.get('/company-lines', authenticateToken, (req, res) => {
             ORDER BY cl.id DESC
             LIMIT ? OFFSET ?
         `;
-
-        db.query(dataQuery, [...params, limitNum, offset], (dataErr, rows) => {
-            if (dataErr) return res.status(500).json({ error: 'Error al obtener líneas', details: dataErr });
-            res.json({
-                data: rows,
-                total,
-                page: pageNum,
-                limit: limitNum,
-                totalPages
-            });
+        const [rows] = await pool.query(dataQuery, [...params, limitNum, offset]);
+        res.json({
+            data: rows,
+            total,
+            page: pageNum,
+            limit: limitNum,
+            totalPages
         });
-    });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Error al consultar líneas corporativas', details: err });
+    }
 });
 
-//? endpoint para crear una nueva línea (roles 1, 2, 3)
-app.post('/company-lines/create-line', authenticateToken, requireRole([1, 2, 3]), (req, res) => {
+// Crear nueva línea corporativa
+app.post('/company-lines/create-line', authenticate, requirePermission('phone-lines.create'), async (req, res) => {
     const { serial, phone_number, status, active_status, operator } = req.body;
-    db.query(
-        'INSERT INTO company_lines (serial, phone_number, status, active_status, operator) VALUES (?, ?, ?, ?, ?)',
-        [serial, phone_number, status || 'disponible', active_status || 'activa', operator],
-        (err, results) => {
-            if (err) {
-                if (err.code === 'ER_DUP_ENTRY') {
-                    return res.status(409).json({ error: 'Ya existe una línea con ese serial o número telefónico' });
-                }
-                return res.status(500).json({ error: 'Error al crear la línea', details: err });
-            }
-            res.status(201).json({ success: true, insertId: results.insertId });
+    try {
+        const [results] = await pool.query(
+            'INSERT INTO company_lines (serial, phone_number, status, active_status, operator) VALUES (?, ?, ?, ?, ?)',
+            [serial.trim(), phone_number.trim(), status || 'disponible', active_status || 'activa', operator]
+        );
+        res.status(201).json({ success: true, insertId: results.insertId });
+    } catch (err) {
+        if (err.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({ error: 'Ya existe una línea con ese serial o número telefónico' });
         }
-    );
+        res.status(500).json({ error: 'Error al crear la línea', details: err });
+    }
 });
 
-//? endpoint para actualizar/modificar una línea (roles 1, 2, 3)
-app.put('/company-lines/:id', authenticateToken, requireRole([1, 2, 3]), (req, res) => {
-    const id = Number(req.params.id);
+// Actualizar línea corporativa
+app.put('/company-lines/:id', authenticate, requirePermission('phone-lines.update'), async (req, res) => {
+    const id = parseId(req.params.id);
     const { serial, phone_number, status, active_status, operator } = req.body;
 
     if (!id || !serial || !phone_number || !operator) {
         return res.status(400).json({ error: 'ID, serial, número y operador son requeridos' });
     }
 
-    db.query(
-        'UPDATE company_lines SET serial = ?, phone_number = ?, status = ?, active_status = ?, operator = ? WHERE id = ?',
-        [serial.trim(), phone_number.trim(), status || 'disponible', active_status || 'activa', operator, id],
-        (err, results) => {
-            if (err) {
-                if (err.code === 'ER_DUP_ENTRY') {
-                    return res.status(409).json({ error: 'Ya existe una línea con ese serial o número telefónico' });
-                }
-                return res.status(500).json({ error: 'Error al actualizar la línea', details: err });
-            }
-            if (results.affectedRows === 0) {
-                return res.status(404).json({ error: 'Línea corporativa no encontrada' });
-            }
-            res.json({ success: true, message: 'Línea corporativa actualizada con éxito' });
-        }
-    );
-});
-
-//? endpoint de login
-app.post('/api/auth/login', (req, res) => {
-    const { username, password } = req.body;
-
-    if (!username || !password) {
-        return res.status(400).json({ error: 'Usuario y contraseña son requeridos' });
-    }
-
-    db.query(`
-        SELECT u.*, ur.role_id 
-        FROM users u 
-        LEFT JOIN user_roles ur ON u.id = ur.user_id 
-        WHERE u.username = ?
-    `, [username], (err, results) => {
-        if (err) return res.status(500).json({ error: 'Error en la base de datos' });
-        
-        if (results.length === 0) {
-            return res.status(401).json({ error: 'Usuario no encontrado' });
-        }
-
-        const user = results[0];
-
-        if (!user.password) {
-            return res.status(401).json({ error: 'Usuario no tiene contraseña configurada' });
-        }
-
-        const validPassword = bcrypt.compareSync(password, user.password);
-        if (!validPassword) {
-            return res.status(401).json({ error: 'Contraseña incorrecta' });
-        }
-
-        const token = jwt.sign(
-            { id: user.id, username: user.username, role_id: user.role_id }, 
-            JWT_SECRET, 
-            { expiresIn: '8h' }
+    try {
+        const [results] = await pool.query(
+            'UPDATE company_lines SET serial = ?, phone_number = ?, status = ?, active_status = ?, operator = ? WHERE id = ?',
+            [serial.trim(), phone_number.trim(), status || 'disponible', active_status || 'activa', operator, id]
         );
-
-        res.json({ success: true, token, user: { id: user.id, name: user.name, username: user.username, role_id: user.role_id } });
-    });
+        if (results.affectedRows === 0) {
+            return res.status(404).json({ error: 'Línea corporativa no encontrada' });
+        }
+        res.json({ success: true, message: 'Línea corporativa actualizada con éxito' });
+    } catch (err) {
+        if (err.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({ error: 'Ya existe una línea con ese serial o número telefónico' });
+        }
+        res.status(500).json({ error: 'Error al actualizar la línea', details: err });
+    }
 });
 
-app.listen(3000, () => {
-    console.log('listening on port 3000');
+// Iniciar servidor
+app.listen(config.port, () => {
+    console.log(`Backend de contactos ejecutándose en el puerto ${config.port}`);
 });
